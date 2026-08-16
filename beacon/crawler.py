@@ -26,6 +26,15 @@ BINARY_EXT = (".pdf", ".epub", ".zip", ".gz", ".png", ".jpg", ".jpeg", ".gif",
 
 _stats = {"fetched": 0, "ok": 0, "failed": 0, "started": time.time()}
 
+# Our own first-party nodes: crawl these AND their deep pages at top priority so
+# station content (Mild Take articles, service pages) indexes immediately instead
+# of behind the ~900-node external backlog. Set via env (comma-separated hashes).
+SEED_NODES = set(h for h in os.environ.get("BEACON_SEED_NODES", "").lower().split(",") if h)
+SEED_INDEX_PRIO = 1
+SEED_DEEP_PRIO = 2
+INDEX_PRIO = 3
+DEEP_PRIO = 6
+
 
 class _NodeAnnounceHandler:
     aspect_filter = f"{NODE_APP}.{NODE_ASPECT}"
@@ -33,25 +42,31 @@ class _NodeAnnounceHandler:
     def __init__(self, conn_factory):
         self._conn_factory = conn_factory
         self._conn = conn_factory()
+        # RNS calls received_announce from multiple threads; a single psycopg2
+        # connection is NOT reentrant ("connection cannot be re-entered
+        # recursively"). Serialize all access to the shared connection.
+        self._lock = threading.Lock()
 
     def received_announce(self, destination_hash, announced_identity, app_data):
-        try:
-            name = None
-            if app_data:
-                try:
-                    name = app_data.decode("utf-8", "replace")[:200]
-                except Exception:
-                    name = None
-            h = RNS.hexrep(destination_hash, delimit=False)
-            db.upsert_node(self._conn, h, name)
-            db.enqueue(self._conn, h, "/page/index.mu", priority=3)
-            RNS.log(f"[beacon] announce: {h} ({name})", RNS.LOG_DEBUG)
-        except Exception as e:  # noqa: BLE001
-            RNS.log(f"[beacon] announce handler error: {e}", RNS.LOG_ERROR)
+        name = None
+        if app_data:
             try:
-                self._conn = self._conn_factory()
+                name = app_data.decode("utf-8", "replace")[:200]
             except Exception:
-                pass
+                name = None
+        h = RNS.hexrep(destination_hash, delimit=False)
+        prio = SEED_INDEX_PRIO if h in SEED_NODES else INDEX_PRIO
+        with self._lock:
+            try:
+                db.upsert_node(self._conn, h, name)
+                db.enqueue(self._conn, h, "/page/index.mu", priority=prio)
+                RNS.log(f"[beacon] announce: {h} ({name})", RNS.LOG_DEBUG)
+            except Exception as e:  # noqa: BLE001
+                RNS.log(f"[beacon] announce handler error: {e}", RNS.LOG_ERROR)
+                try:
+                    self._conn = self._conn_factory()
+                except Exception:
+                    pass
 
 
 def _is_binary(path):
@@ -131,10 +146,14 @@ def _process(conn, item):
                    md_declared=bool(meshdata.parse(raw)))
     edges = micron.extract_links(raw, node_hash)
     db.record_links(conn, url, edges)
+    # Deep pages of our own nodes crawl right after our indexes (prio 2), ahead of
+    # the external index backlog (prio 3); external deep pages stay at prio 6.
+    deep_prio = SEED_DEEP_PRIO if node_hash in SEED_NODES else DEEP_PRIO
     for to_url, nh, p in edges:
         if not _is_binary(p):
-            db.upsert_node(conn, nh, None) if nh != node_hash else None
-            db.enqueue(conn, nh, p, priority=6)
+            if nh != node_hash:
+                db.upsert_node(conn, nh, None)
+            db.enqueue(conn, nh, p, priority=(SEED_DEEP_PRIO if nh in SEED_NODES else deep_prio))
     db.drop_queue(conn, url)
     db.mark_node_crawled(conn, node_hash, reachable=True)
     _stats["ok"] += 1

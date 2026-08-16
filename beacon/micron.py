@@ -26,6 +26,8 @@ def extract_links(text, node_hash):
         nh, path = node_hash, None
         if target.startswith(":"):
             path = target[1:]                       # same node, ":/page/x.mu"
+        elif target.startswith("/page/"):
+            path = target                           # same node, bare "/page/x.mu"
         elif ":" in target:
             h, _, p = target.partition(":")
             if _HEX.match(h):
