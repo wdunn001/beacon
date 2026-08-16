@@ -4,6 +4,7 @@ Connection comes from env (BEACON_DB_*). FTS is built in: pages carry a generate
 tsvector so search + ts_rank work from day one, ahead of the richer ranking stage.
 """
 import os
+import re
 import time
 
 import psycopg2
@@ -99,6 +100,16 @@ CREATE TABLE IF NOT EXISTS page_events (
 );
 CREATE INDEX IF NOT EXISTS page_events_ts_idx   ON page_events (ts);
 CREATE INDEX IF NOT EXISTS page_events_node_idx ON page_events (node);
+
+-- "Did you mean?": a corpus lexicon (lexemes from page content) with a trigram
+-- index, so a misspelt query ("colarado") can be matched to the nearest real
+-- term ("colorado") via pg_trgm similarity. Refreshed periodically from ts_stat.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE TABLE IF NOT EXISTS lexicon (
+    word TEXT PRIMARY KEY,
+    df   INTEGER NOT NULL DEFAULT 1      -- document frequency (rarer = weaker suggestion)
+);
+CREATE INDEX IF NOT EXISTS lexicon_trgm_idx ON lexicon USING GIN (word gin_trgm_ops);
 """
 
 
@@ -403,3 +414,67 @@ def search(conn, query, limit=15, ptype=None):
             "score": round(float(r["score"]), 5),
         })
     return out
+
+
+# ---- "Did you mean?" spelling suggestions (pg_trgm) -------------------------
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_SUGGEST_MIN_SIM = 0.42        # trigram similarity floor for a correction
+_LEXICON_MIN_DF = 2            # ignore words seen in <2 pages (noise)
+
+
+def refresh_lexicon(conn):
+    """(Re)build the corpus lexicon from indexed page content. Uses ts_stat over
+    the FTS vectors so we get the same lexemes search matches on. Cheap enough to
+    run periodically (hundreds of pages)."""
+    with conn, conn.cursor() as c:
+        c.execute(
+            """INSERT INTO lexicon (word, df)
+               SELECT word, ndoc FROM ts_stat('SELECT content_tsv FROM pages WHERE ok')
+               WHERE word ~ '^[a-z][a-z]{2,29}$' AND ndoc >= %s
+               ON CONFLICT (word) DO UPDATE SET df = EXCLUDED.df""",
+            (_LEXICON_MIN_DF,),
+        )
+
+
+def suggest(conn, query):
+    """Return a corrected query string if some token is a likely misspelling of a
+    real corpus word ("colarado" -> "colorado"), else None. Each unknown token is
+    matched to its nearest trigram neighbour above a similarity floor; known tokens
+    (present in the lexicon) are left untouched."""
+    if not query or not query.strip():
+        return None
+    tokens = _WORD_RE.findall(query.lower())
+    if not tokens:
+        return None
+    changed = False
+    fixed = list(tokens)
+    with conn, conn.cursor() as c:
+        for i, tok in enumerate(tokens):
+            if len(tok) < 4:                      # too short to correct reliably
+                continue
+            c.execute("SELECT 1 FROM lexicon WHERE word = %s", (tok,))
+            if c.fetchone():                      # already a real corpus word
+                continue
+            # nearest neighbour by trigram similarity (index-assisted via `%`)
+            c.execute(
+                """SELECT word, similarity(word, %s) AS s
+                   FROM lexicon
+                   WHERE word %% %s
+                   ORDER BY s DESC, df DESC
+                   LIMIT 1""",
+                (tok, tok),
+            )
+            row = c.fetchone()
+            if row and row[1] is not None and float(row[1]) >= _SUGGEST_MIN_SIM and row[0] != tok:
+                cand = row[0]
+                # The lexicon holds STEMMED lexemes, so a valid inflection ("dogs"
+                # vs the lexeme "dog") looks unknown. Don't "correct" a word to its
+                # own stem/prefix -- only offer genuinely different spellings.
+                if tok.startswith(cand) or cand.startswith(tok):
+                    continue
+                fixed[i] = cand
+                changed = True
+    if not changed:
+        return None
+    # rebuild the phrase, preserving original spacing loosely (single spaces)
+    return " ".join(fixed)

@@ -174,6 +174,7 @@ def _recrawl_loop(conn_factory):
     while True:
         try:
             db.enqueue_recrawl(conn, RECRAWL_HOURS)
+            db.refresh_lexicon(conn)      # keep the "did you mean?" lexicon current
         except Exception as e:  # noqa: BLE001
             RNS.log(f"[beacon] recrawl error: {e}", RNS.LOG_DEBUG)
             try:

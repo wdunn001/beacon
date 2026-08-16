@@ -29,6 +29,10 @@ def main():
 
     init_conn = conn_factory()
     db.init_schema(init_conn)
+    try:
+        db.refresh_lexicon(init_conn)     # seed the "did you mean?" lexicon on boot
+    except Exception as e:  # noqa: BLE001
+        RNS.log(f"[beacon] lexicon seed skipped: {e}", RNS.LOG_DEBUG)
     init_conn.close()
     RNS.log("[beacon] schema ready")
 

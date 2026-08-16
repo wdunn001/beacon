@@ -97,6 +97,16 @@ def _make_handler(conn_factory):
                     res.append(w)
             res.sort(key=lambda r: r.get("score", 0), reverse=True)
             res = res[:limit]
+            # "Did you mean?": when results are thin, offer a spell-corrected query
+            # (pg_trgm nearest corpus term). Cheap, and only when it would help.
+            suggestion = None
+            if len(res) < 3:
+                try:
+                    suggestion = db.suggest(conn, q)
+                except Exception as e:  # noqa: BLE001
+                    RNS.log(f"[beacon] suggest error: {e}", RNS.LOG_DEBUG)
+                if suggestion and suggestion.strip().lower() == q.strip().lower():
+                    suggestion = None
         except Exception as e:  # noqa: BLE001
             RNS.log(f"[beacon] search error: {e}", RNS.LOG_ERROR)
             return protocol.pack(protocol.err("backend_error", req))
@@ -106,7 +116,10 @@ def _make_handler(conn_factory):
                     conn.close()
                 except Exception:
                     pass
-        return protocol.pack(protocol.ok({"res": res}, req))
+        payload = {"res": res}
+        if suggestion:
+            payload["suggestion"] = suggestion
+        return protocol.pack(protocol.ok(payload, req))
     return handler
 
 
