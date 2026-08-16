@@ -15,6 +15,8 @@ def main():
                     help="RNS config dir")
     ap.add_argument("--http-port", type=int,
                     default=int(os.environ.get("BEACON_HTTP_PORT", "8214")))
+    ap.add_argument("--analytics-port", type=int,
+                    default=int(os.environ.get("BEACON_ANALYTICS_PORT", "8218")))
     args = ap.parse_args()
 
     RNS.Reticulum(args.config)
@@ -39,8 +41,8 @@ def main():
     search_identity = os.environ.get("BEACON_SEARCH_IDENTITY", "/data/search-identity")
     searchd.start(conn_factory, search_identity)
 
-    web.start(conn_factory, args.http_port)
-    RNS.log(f"[beacon] http on :{args.http_port}")
+    web.start(conn_factory, args.http_port, args.analytics_port)
+    RNS.log(f"[beacon] http on :{args.http_port}, analytics on :{args.analytics_port}")
 
     print("beacon: crawler + registry running", flush=True)
     crawler.crawl_loop(conn_factory)   # blocks
