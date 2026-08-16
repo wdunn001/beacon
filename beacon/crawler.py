@@ -59,7 +59,8 @@ class _NodeAnnounceHandler:
         with self._lock:
             try:
                 db.upsert_node(self._conn, h, name)
-                db.enqueue(self._conn, h, "/page/index.mu", priority=prio)
+                db.enqueue(self._conn, h, "/page/index.mu", priority=prio,
+                           fresh_hours=RECRAWL_HOURS)
                 RNS.log(f"[beacon] announce: {h} ({name})", RNS.LOG_DEBUG)
             except Exception as e:  # noqa: BLE001
                 RNS.log(f"[beacon] announce handler error: {e}", RNS.LOG_ERROR)
@@ -157,7 +158,8 @@ def _process(conn, item):
         if not _is_binary(p) and not p.endswith("/read.mu"):
             if nh != node_hash:
                 db.upsert_node(conn, nh, None)
-            db.enqueue(conn, nh, p, priority=(SEED_DEEP_PRIO if nh in SEED_NODES else deep_prio))
+            db.enqueue(conn, nh, p, priority=(SEED_DEEP_PRIO if nh in SEED_NODES else deep_prio),
+                       fresh_hours=RECRAWL_HOURS)
     db.drop_queue(conn, url)
     db.mark_node_crawled(conn, node_hash, reachable=True)
     _stats["ok"] += 1

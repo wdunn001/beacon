@@ -121,14 +121,31 @@ def upsert_node(conn, dest_hash, name):
         )
 
 
-def enqueue(conn, node_hash, path, priority=5):
+def enqueue(conn, node_hash, path, priority=5, fresh_hours=None):
+    """Queue a page for crawling. With fresh_hours set, a page we already crawled
+    OK within that window is NOT re-queued -- this stops a densely interlinked site
+    (e.g. The Mild Take) from re-enqueuing its own pages the instant they're crawled
+    and monopolising the workers; enqueue_recrawl reclaims stale pages after the
+    recrawl interval instead."""
     url = f"{node_hash}:{path}"
     with conn, conn.cursor() as c:
-        c.execute(
-            """INSERT INTO crawl_queue (url, node_hash, path, priority)
-               VALUES (%s, %s, %s, %s) ON CONFLICT (url) DO NOTHING""",
-            (url, node_hash, path, priority),
-        )
+        if fresh_hours:
+            c.execute(
+                """INSERT INTO crawl_queue (url, node_hash, path, priority)
+                   SELECT %s, %s, %s, %s
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM pages
+                       WHERE url = %s AND ok
+                         AND fetched_at > now() - (%s || ' hours')::interval)
+                   ON CONFLICT (url) DO NOTHING""",
+                (url, node_hash, path, priority, url, int(fresh_hours)),
+            )
+        else:
+            c.execute(
+                """INSERT INTO crawl_queue (url, node_hash, path, priority)
+                   VALUES (%s, %s, %s, %s) ON CONFLICT (url) DO NOTHING""",
+                (url, node_hash, path, priority),
+            )
     return url
 
 
@@ -235,6 +252,12 @@ def stats(conn):
         c.execute("SELECT count(*) FROM crawl_queue WHERE next_attempt <= now()"); out["queue_due"] = c.fetchone()[0]
         c.execute("SELECT count(*) FROM crawl_queue"); out["queue_total"] = c.fetchone()[0]
         c.execute("SELECT count(*) FROM pages WHERE md_declared"); out["md_declared"] = c.fetchone()[0]
+        # Durable, DB-backed activity metrics (survive restarts, unlike the
+        # in-memory crawler session counters that reset to 0 on every redeploy).
+        c.execute("SELECT count(*) FROM pages WHERE ok AND fetched_at > now() - interval '24 hours'")
+        out["fetched_24h"] = c.fetchone()[0]
+        c.execute("SELECT count(*) FROM nodes WHERE reachable"); out["reachable"] = c.fetchone()[0]
+        c.execute("SELECT count(*) FROM nodes WHERE reachable IS FALSE"); out["unreachable"] = c.fetchone()[0]
         return out
 
 

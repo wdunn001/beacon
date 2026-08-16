@@ -7,7 +7,7 @@
     POST /ev          -> Beacon-Analytics RUM ingest (page-view events from our
                          NomadNet nodes over fast localhost HTTP)
 
-  analytics server (BEACON_ANALYTICS_PORT, default 8218) -> analytics.quasarke.net
+  analytics server (BEACON_ANALYTICS_PORT, default 8218) -> rns-analytics.quasarke.net
     GET  /            -> Beacon-Analytics dashboard (charts, analytics only)
     GET  /healthz     -> RUM JSON
 
@@ -117,7 +117,7 @@ def _svg_area(days, width=1040, height=180):
 
 
 def _analytics_html(conn):
-    """Standalone Beacon-Analytics dashboard (analytics.quasarke.net) -- charts."""
+    """Standalone Beacon-Analytics dashboard (rns-analytics.quasarke.net) -- charts."""
     rum = db.rum_stats(conn)
     nodes = db.rum_by_node(conn, 100)
     pages = db.rum_top_pages(conn, 20)
@@ -141,7 +141,7 @@ def _analytics_html(conn):
 <style>{_CSS}</style></head><body>
 <h1>&#128225; Beacon-Analytics</h1>
 <p class=sub>page-view analytics for the quasarke mesh nodes &middot; visitor ids are
-hashed &mdash; no identities stored &middot; auto-refresh 60s</p>
+hashed &middot; no identities stored &middot; auto-refresh 60s</p>
 <div class=grid>{cards}</div>
 
 <h2>Views over time &middot; last 14 days</h2>
@@ -173,12 +173,15 @@ def _dashboard_html(conn):
     def esc(x):
         return html.escape(str(x))
 
+    # All durable, DB-backed (survive restarts). The in-memory session counters
+    # (crawler.stats ok/failed) used to sit here and reset to 0 on every redeploy,
+    # which read as the dashboard "resetting" -- they now live in the session line.
     cards = "".join(
         f'<div class=c><div class=n>{esc(v)}</div><div class=l>{esc(k)}</div></div>'
         for k, v in [("nodes", s["nodes"]), ("pages", s["pages"]),
                      ("with MeshData", s.get("md_declared", 0)), ("links", s["links"]),
-                     ("queue due", s["queue_due"]), ("queue total", s["queue_total"]),
-                     ("crawled ok", cr.get("ok", 0)), ("failed", cr.get("failed", 0))])
+                     ("fetched 24h", s.get("fetched_24h", 0)), ("reachable", s.get("reachable", 0)),
+                     ("queue due", s["queue_due"]), ("queue total", s["queue_total"])])
     rcards = "".join(
         f'<div class=c><div class=n>{esc(v)}</div><div class=l>{esc(k)}</div></div>'
         for k, v in [("page views", rum["events"]), ("unique visitors", rum["visitors"]),
@@ -219,8 +222,9 @@ td{{padding:4px 8px;border-bottom:1px solid #0f1a0f}} .m{{color:var(--mut)}}
 a{{color:var(--dim)}}
 </style></head><body>
 <h1>&#9673; Beacon mesh crawler</h1>
-<p class=sub>private operator view &middot; uptime ~{up_h}h &middot; auto-refresh 30s
-&middot; <a href="//analytics.quasarke.net">Beacon-Analytics &rarr;</a></p>
+<p class=sub>private operator view &middot; this session (~{up_h}h): {esc(cr.get('ok', 0))} ok,
+{esc(cr.get('failed', 0))} failed &middot; auto-refresh 30s
+&middot; <a href="//rns-analytics.quasarke.net">Beacon-Analytics &rarr;</a></p>
 <div class=grid>{cards}</div>
 <div class=cols>
 <div><h2>Page types</h2><table>{catrows or '<tr><td class=m>none yet</td></tr>'}</table>
@@ -229,7 +233,7 @@ a{{color:var(--dim)}}
 </div>
 <h1 style="margin-top:34px">&#128225; Beacon-Analytics</h1>
 <p class=sub>RUM page views for our NomadNet nodes &middot; visitor ids are hashed (no identities stored)
-&middot; <a href="//analytics.quasarke.net">full analytics dashboard &rarr;</a></p>
+&middot; <a href="//rns-analytics.quasarke.net">full analytics dashboard &rarr;</a></p>
 <div class=grid>{rcards}</div>
 <div class=cols>
 <div><h2>Views by node</h2><table><tr class=m><td>node</td><td>views</td><td>uniq</td></tr>{rnoderows or '<tr><td class=m>no views yet</td></tr>'}</table>
