@@ -86,6 +86,19 @@ CREATE TABLE IF NOT EXISTS clicks (
     clicks       BIGINT NOT NULL DEFAULT 0,
     last_clicked TIMESTAMPTZ
 );
+
+-- Beacon-Analytics: RUM-style page views for our NomadNet nodes. `vid` is an
+-- OPAQUE HASH of the visitor's identity (never the raw identity) for unique
+-- counts only; the dashboard shows counts, never identities.
+CREATE TABLE IF NOT EXISTS page_events (
+    id   BIGSERIAL PRIMARY KEY,
+    ts   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    node TEXT NOT NULL,
+    path TEXT NOT NULL,
+    vid  TEXT
+);
+CREATE INDEX IF NOT EXISTS page_events_ts_idx   ON page_events (ts);
+CREATE INDEX IF NOT EXISTS page_events_node_idx ON page_events (node);
 """
 
 
@@ -248,6 +261,48 @@ def top_nodes(conn, limit=15):
                   (limit,))
         return [{"name": r[0], "hash": r[1], "announces": r[2],
                  "last_seen": r[3].isoformat() if r[3] else None} for r in c.fetchall()]
+
+
+# ---- Beacon-Analytics (mesh RUM) -------------------------------------------
+def record_event(conn, node, path, vid):
+    with conn, conn.cursor() as c:
+        c.execute("INSERT INTO page_events (node, path, vid) VALUES (%s,%s,%s)",
+                  (node[:64], path[:200], (vid or None)))
+
+
+def rum_stats(conn):
+    with conn, conn.cursor() as c:
+        out = {}
+        c.execute("SELECT count(*) FROM page_events"); out["events"] = c.fetchone()[0]
+        c.execute("SELECT count(DISTINCT vid) FROM page_events WHERE vid IS NOT NULL")
+        out["visitors"] = c.fetchone()[0]
+        c.execute("SELECT count(*) FROM page_events WHERE ts > now() - interval '24 hours'")
+        out["events_24h"] = c.fetchone()[0]
+        return out
+
+
+def rum_by_node(conn, limit=20):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT node, count(*) v, count(DISTINCT vid) u FROM page_events "
+                  "GROUP BY node ORDER BY v DESC LIMIT %s", (limit,))
+        return [{"node": r[0], "views": r[1], "visitors": r[2]} for r in c.fetchall()]
+
+
+def rum_top_pages(conn, limit=20):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT node, path, count(*) v, count(DISTINCT vid) u FROM page_events "
+                  "GROUP BY node, path ORDER BY v DESC LIMIT %s", (limit,))
+        return [{"node": r[0], "path": r[1], "views": r[2], "visitors": r[3]}
+                for r in c.fetchall()]
+
+
+def rum_by_day(conn, days=14):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT date_trunc('day', ts)::date d, count(*) v, count(DISTINCT vid) u "
+                  "FROM page_events WHERE ts > now() - (%s || ' days')::interval "
+                  "GROUP BY d ORDER BY d DESC", (days,))
+        return [{"day": r[0].isoformat(), "views": r[1], "visitors": r[2]}
+                for r in c.fetchall()]
 
 
 def record_click(conn, url):
