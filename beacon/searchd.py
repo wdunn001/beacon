@@ -123,6 +123,13 @@ def _make_handler(conn_factory):
                     RNS.log(f"[beacon] suggest error: {e}", RNS.LOG_DEBUG)
                 if suggestion and suggestion.strip().lower() == q.strip().lower():
                     suggestion = None
+            # Search analytics: log the query + how many results it found (only the
+            # first page request, so paging through results isn't double-counted).
+            if offset == 0:
+                try:
+                    db.record_search(conn, q, total, bool(suggestion))
+                except Exception as e:  # noqa: BLE001
+                    RNS.log(f"[beacon] record_search error: {e}", RNS.LOG_DEBUG)
         except Exception as e:  # noqa: BLE001
             RNS.log(f"[beacon] search error: {e}", RNS.LOG_ERROR)
             return protocol.pack(protocol.err("backend_error", req))

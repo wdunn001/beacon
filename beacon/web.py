@@ -122,11 +122,21 @@ def _analytics_html(conn):
     nodes = db.rum_by_node(conn, 100)
     pages = db.rum_top_pages(conn, 20)
     days = db.rum_by_day(conn, 14)
+    ss = db.search_stats(conn)
+    top_q = db.top_searches(conn, 15)
+    zero_q = db.zero_result_searches(conn, 15)
 
     cards = "".join(
         f'<div class=c><div class=n>{_esc(f"{v:,}")}</div><div class=l>{_esc(k)}</div></div>'
         for k, v in [("page views", rum["events"]), ("unique visitors", rum["visitors"]),
-                     ("views 24h", rum["events_24h"]), ("active nodes", len(nodes))])
+                     ("views 24h", rum["events_24h"]), ("active nodes", len(nodes)),
+                     ("searches", ss["searches"]), ("zero-result", ss["zero_result"])])
+
+    topqrows = "".join(
+        f'<tr><td>{_esc(s["q"][:48])}</td><td class=r>{s["count"]:,}</td>'
+        f'<td class=r m>{s["hits"]:,}</td></tr>' for s in top_q)
+    zeroqrows = "".join(
+        f'<tr><td>{_esc(s["q"][:48])}</td><td class=r>{s["count"]:,}</td></tr>' for s in zero_q)
 
     maxp = max((p["views"] for p in pages), default=0) or 1
     pagerows = "".join(
@@ -152,6 +162,18 @@ hashed &middot; no identities stored &middot; auto-refresh 60s</p>
 <div><h2>Top pages</h2><div class=panel><table>
 <tr><th>node</th><th>path</th><th class=r>views</th><th class=r>uniq</th><th></th></tr>
 {pagerows or '<tr><td class=m colspan=5>no views yet</td></tr>'}
+</table></div></div>
+</div>
+
+<h2>Search &middot; what people look for</h2>
+<div class=cols>
+<div><h3 class=sub style="margin:0 0 8px">Top searches</h3><div class=panel><table>
+<tr><th>query</th><th class=r>times</th><th class=r>results</th></tr>
+{topqrows or '<tr><td class=m colspan=3>no searches yet</td></tr>'}
+</table></div></div>
+<div><h3 class=sub style="margin:0 0 8px">Zero-result searches (fix coverage/ranking)</h3><div class=panel><table>
+<tr><th>query</th><th class=r>times</th></tr>
+{zeroqrows or '<tr><td class=m colspan=2>none yet; every query found something</td></tr>'}
 </table></div></div>
 </div>
 <p class=sub style="margin-top:24px">&#9673; Beacon &middot; <a href="//crawler.quasarke.net">crawler dashboard</a></p>

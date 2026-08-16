@@ -101,6 +101,20 @@ CREATE TABLE IF NOT EXISTS page_events (
 CREATE INDEX IF NOT EXISTS page_events_ts_idx   ON page_events (ts);
 CREATE INDEX IF NOT EXISTS page_events_node_idx ON page_events (node);
 
+-- Search analytics: one row per query the search service handles, so the
+-- dashboard can show most-searched terms and zero-result queries (to debug
+-- ranking/coverage gaps). `q` is the normalised query text -- NOT tied to any
+-- visitor identity (aggregate popularity only).
+CREATE TABLE IF NOT EXISTS searches (
+    id        BIGSERIAL PRIMARY KEY,
+    ts        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    q         TEXT NOT NULL,
+    results   INTEGER NOT NULL DEFAULT 0,
+    suggested BOOLEAN NOT NULL DEFAULT FALSE   -- did we offer a "did you mean?"
+);
+CREATE INDEX IF NOT EXISTS searches_ts_idx ON searches (ts);
+CREATE INDEX IF NOT EXISTS searches_q_idx  ON searches (q);
+
 -- "Did you mean?": a corpus lexicon (lexemes from page content) with a trigram
 -- index, so a misspelt query ("colarado") can be matched to the nearest real
 -- term ("colorado") via pg_trgm similarity. Refreshed periodically from ts_stat.
@@ -337,6 +351,44 @@ def rum_by_day(conn, days=14):
                   "GROUP BY d ORDER BY d DESC", (days,))
         return [{"day": r[0].isoformat(), "views": r[1], "visitors": r[2]}
                 for r in c.fetchall()]
+
+
+# ---- Search analytics (what people search, and what returns nothing) --------
+def record_search(conn, q, results, suggested=False):
+    """Log a handled query for analytics. `q` is normalised (lowercased, trimmed,
+    collapsed whitespace) so popularity groups cleanly; it is NOT linked to any
+    visitor. Overly long queries are truncated."""
+    qn = " ".join((q or "").lower().split())[:200]
+    if not qn:
+        return
+    with conn, conn.cursor() as c:
+        c.execute("INSERT INTO searches (q, results, suggested) VALUES (%s,%s,%s)",
+                  (qn, int(results), bool(suggested)))
+
+
+def search_stats(conn):
+    with conn, conn.cursor() as c:
+        out = {}
+        c.execute("SELECT count(*) FROM searches"); out["searches"] = c.fetchone()[0]
+        c.execute("SELECT count(*) FROM searches WHERE ts > now() - interval '24 hours'")
+        out["searches_24h"] = c.fetchone()[0]
+        c.execute("SELECT count(*) FROM searches WHERE results = 0"); out["zero_result"] = c.fetchone()[0]
+        return out
+
+
+def top_searches(conn, limit=15):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT q, count(*) n, max(results) hits FROM searches "
+                  "GROUP BY q ORDER BY n DESC, max(ts) DESC LIMIT %s", (limit,))
+        return [{"q": r[0], "count": r[1], "hits": r[2]} for r in c.fetchall()]
+
+
+def zero_result_searches(conn, limit=15):
+    """Queries that returned nothing -- the coverage/ranking debug list."""
+    with conn, conn.cursor() as c:
+        c.execute("SELECT q, count(*) n, max(ts) last FROM searches WHERE results = 0 "
+                  "GROUP BY q ORDER BY n DESC, last DESC LIMIT %s", (limit,))
+        return [{"q": r[0], "count": r[1]} for r in c.fetchall()]
 
 
 def record_click(conn, url):
