@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beacon-mesh"
+version = "0.1.0"
+description = "A FOSS search engine for the Reticulum mesh: crawler, registry, and index."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "wdunn001" }]
+requires-python = ">=3.9"
+dependencies = ["rns", "umsgpack", "psycopg2-binary"]
+
+[project.urls]
+Homepage = "https://github.com/wdunn001/beacon"
+
+[tool.setuptools]
+packages = ["beacon"]

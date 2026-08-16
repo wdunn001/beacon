@@ -1,0 +1,18 @@
+services:
+  beacon:
+    build: .
+    image: beacon:local
+    container_name: beacon
+    restart: unless-stopped
+    # host networking: reach a local Postgres (127.0.0.1:5432), dial the mesh
+    # backbone, and expose /healthz on :8214.
+    network_mode: host
+    env_file:
+      - .env                 # BEACON_DB_HOST/PORT/NAME/USER/PASSWORD (never in git)
+    environment:
+      PYTHONUNBUFFERED: "1"
+      BEACON_HTTP_PORT: "8214"
+      BEACON_FETCH_DELAY: "30"       # seconds between page fetches (LoRa politeness)
+      BEACON_RECRAWL_HOURS: "24"
+    volumes:
+      - ./config/rns-config:/config/rns/config:ro    # RNS writes storage under /config/rns (container layer)

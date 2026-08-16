@@ -1,0 +1,22 @@
+# Example Reticulum config for the Beacon crawler. It runs its OWN RNS instance
+# (own identity) so crawl traffic is isolated from other nodes. Point it at a
+# transport node you can reach; a public backbone relays the announce stream the
+# crawler needs to discover nodes.
+#
+# interface_enabled = True is REQUIRED on every block (RNS silently skips blocks
+# without it).
+[reticulum]
+  enable_transport = No
+  share_instance = No
+  instance_name = beacon_crawler
+
+[logging]
+  loglevel = 4
+
+[interfaces]
+  [[Backbone]]
+    type = TCPClientInterface
+    interface_enabled = True
+    enabled = True
+    target_host = your-backbone.example
+    target_port = 4965
