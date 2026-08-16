@@ -51,7 +51,7 @@ table{{width:100%;border-collapse:collapse;font-size:.82rem;margin-bottom:22px}}
 td{{padding:4px 8px;border-bottom:1px solid #0f1a0f}} .m{{color:var(--mut)}}
 .cols{{display:grid;grid-template-columns:1fr 1fr;gap:26px}} @media(max-width:720px){{.cols{{grid-template-columns:1fr}}}}
 </style></head><body>
-<h1>&#9673; Beacon &mdash; mesh crawler</h1>
+<h1>&#9673; Beacon mesh crawler</h1>
 <p class=sub>private operator view &middot; uptime ~{up_h}h &middot; auto-refresh 30s</p>
 <div class=grid>{cards}</div>
 <div class=cols>
