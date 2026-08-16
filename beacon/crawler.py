@@ -17,8 +17,8 @@ from . import db, micron
 
 NODE_APP = "nomadnetwork"
 NODE_ASPECT = "node"
-FETCH_DELAY = float(os.environ.get("BEACON_FETCH_DELAY", "30"))   # seconds between fetches
-LINK_TIMEOUT = float(os.environ.get("BEACON_LINK_TIMEOUT", "45"))
+FETCH_DELAY = float(os.environ.get("BEACON_FETCH_DELAY", "2"))    # seconds between fetches (politeness)
+LINK_TIMEOUT = float(os.environ.get("BEACON_LINK_TIMEOUT", "15"))  # fast-fail unreachable pages
 RECRAWL_HOURS = int(os.environ.get("BEACON_RECRAWL_HOURS", "24"))
 MAX_PAGE_BYTES = int(os.environ.get("BEACON_MAX_PAGE_BYTES", str(512 * 1024)))
 BINARY_EXT = (".pdf", ".epub", ".zip", ".gz", ".png", ".jpg", ".jpeg", ".gif",
@@ -124,7 +124,9 @@ def _process(conn, item):
         db.drop_queue(conn, url)
         return
     _stats["fetched"] += 1
+    _t0 = time.time()
     data = fetch_page(node_hash, path)
+    fetch_ms = int((time.time() - _t0) * 1000)   # responsiveness -> ranking signal
     if data is None:
         _stats["failed"] += 1
         attempts = item.get("attempts", 0)
@@ -143,14 +145,16 @@ def _process(conn, item):
     db.record_page(conn, url, node_hash, path, title, text, chash, len(data), ok=True,
                    ptype=md.get("type"), description=md.get("description"),
                    lang=md.get("lang"), tags=md.get("tags"),
-                   md_declared=bool(meshdata.parse(raw)))
+                   md_declared=bool(meshdata.parse(raw)), fetch_ms=fetch_ms)
     edges = micron.extract_links(raw, node_hash)
     db.record_links(conn, url, edges)
     # Deep pages of our own nodes crawl right after our indexes (prio 2), ahead of
     # the external index backlog (prio 3); external deep pages stay at prio 6.
     deep_prio = SEED_DEEP_PRIO if node_hash in SEED_NODES else DEEP_PRIO
     for to_url, nh, p in edges:
-        if not _is_binary(p):
+        # Record every edge (link-graph ranking), but don't ENQUEUE dynamic
+        # reader pages -- read.mu needs a ref/field, so crawling it bare is junk.
+        if not _is_binary(p) and not p.endswith("/read.mu"):
             if nh != node_hash:
                 db.upsert_node(conn, nh, None)
             db.enqueue(conn, nh, p, priority=(SEED_DEEP_PRIO if nh in SEED_NODES else deep_prio))

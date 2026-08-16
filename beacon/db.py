@@ -76,7 +76,16 @@ ALTER TABLE pages ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS lang        TEXT;
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS tags        TEXT[];
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS md_declared BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS fetch_ms    INTEGER;
 CREATE INDEX IF NOT EXISTS pages_type_idx ON pages (type);
+
+-- Click promotion: any result URL (a crawled page OR a federated wiki article)
+-- accrues weight as users open it, so popular results rank up over time.
+CREATE TABLE IF NOT EXISTS clicks (
+    url          TEXT PRIMARY KEY,
+    clicks       BIGINT NOT NULL DEFAULT 0,
+    last_clicked TIMESTAMPTZ
+);
 """
 
 
@@ -137,20 +146,21 @@ def drop_queue(conn, url):
 
 def record_page(conn, url, node_hash, path, title, content, content_hash, nbytes,
                 ok=True, ptype=None, description=None, lang=None, tags=None,
-                md_declared=False):
+                md_declared=False, fetch_ms=None):
     with conn, conn.cursor() as c:
         c.execute(
             """INSERT INTO pages (url, node_hash, path, title, content, content_hash,
-                                  bytes, ok, type, description, lang, tags, md_declared, fetched_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                                  bytes, ok, type, description, lang, tags, md_declared,
+                                  fetch_ms, fetched_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
                ON CONFLICT (url) DO UPDATE
                  SET title=EXCLUDED.title, content=EXCLUDED.content,
                      content_hash=EXCLUDED.content_hash, bytes=EXCLUDED.bytes,
                      ok=EXCLUDED.ok, type=EXCLUDED.type, description=EXCLUDED.description,
                      lang=EXCLUDED.lang, tags=EXCLUDED.tags, md_declared=EXCLUDED.md_declared,
-                     fetched_at=now()""",
+                     fetch_ms=EXCLUDED.fetch_ms, fetched_at=now()""",
             (url, node_hash, path, title, content, content_hash, nbytes, ok,
-             ptype, description, lang, tags, md_declared),
+             ptype, description, lang, tags, md_declared, fetch_ms),
         )
 
 
@@ -223,12 +233,33 @@ def top_nodes(conn, limit=15):
                  "last_seen": r[3].isoformat() if r[3] else None} for r in c.fetchall()]
 
 
-# Ranking = full-text relevance (ts_rank_cd) with two boosts the user asked for:
-#   * MeshData schema bonus -- a page that declares its type/description via
-#     MeshData is better-described and rewarded (+40%);
-#   * node-trust -- pages on nodes that announce more (more established) get a
-#     gentle log-scaled lift.
-# Uniqueness/value scoring is a later stage; this is the honest first cut.
+def record_click(conn, url):
+    """Log an opened result; promotes it in ranking over time."""
+    with conn, conn.cursor() as c:
+        c.execute("INSERT INTO clicks (url, clicks, last_clicked) VALUES (%s, 1, now()) "
+                  "ON CONFLICT (url) DO UPDATE SET clicks = clicks.clicks + 1, "
+                  "last_clicked = now()", (url,))
+
+
+def rank_bonus(conn, url):
+    """Link-graph + click promotion for a URL that may NOT be a crawled page
+    (e.g. a federated wiki article that gets linked/clicked). ln-scaled, additive."""
+    import math
+    with conn, conn.cursor() as c:
+        c.execute("SELECT count(*) FROM links WHERE to_url = %s", (url,))
+        inbound = c.fetchone()[0]
+        c.execute("SELECT clicks FROM clicks WHERE url = %s", (url,))
+        row = c.fetchone()
+    clk = row[0] if row else 0
+    return round(math.log1p(inbound) * 0.2 + math.log1p(clk) * 0.3, 5)
+
+
+# Ranking = full-text relevance (ts_rank_cd) with the boosts the user asked for:
+#   * MeshData schema bonus (+40% for a self-describing page);
+#   * node-trust (log-scaled by announce count);
+#   * click promotion (ln clicks) + link-graph promotion (ln inbound links) --
+#     so a page that gets opened or linked elsewhere ranks up over time. This is
+#     what folds federated wiki hits into the same ranked data as it's referenced.
 def search(conn, query, limit=15, ptype=None):
     if not query or not query.strip():
         return []
@@ -249,10 +280,16 @@ def search(conn, query, limit=15, ptype=None):
                    'MaxWords=30, MinWords=12, ShortWord=3, MaxFragments=1, StartSel=[, StopSel=]') AS snippet,
                (ts_rank_cd(p.content_tsv, q.tsq)
                  * (1.0 + 0.4*(p.md_declared)::int)
-                 * (1.0 + ln(1+coalesce(n.announce_count,1))*0.1)) AS score
+                 * (1.0 + ln(1+coalesce(n.announce_count,1))*0.1)
+                 -- responsiveness: fast load lifts, a 15s load drops (0.85..1.15x)
+                 * (1.15 - least(coalesce(p.fetch_ms, 3000), 15000) / 15000.0 * 0.30)
+                 + ln(1 + coalesce(cl.clicks, 0)) * 0.3
+                 + ln(1 + (SELECT count(*) FROM links l WHERE l.to_url = p.url)) * 0.2
+               ) AS score
         FROM pages p
         CROSS JOIN q
         LEFT JOIN nodes n ON n.dest_hash = p.node_hash
+        LEFT JOIN clicks cl ON cl.url = p.url
         WHERE p.ok AND p.content_tsv @@ q.tsq{type_clause}
         ORDER BY score DESC
         LIMIT %s

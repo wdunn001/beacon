@@ -12,7 +12,7 @@ import time
 
 import RNS
 
-from . import db, manifest, protocol
+from . import db, federate, manifest, protocol
 
 ANNOUNCE_INTERVAL = 900
 PER_LINK_RPS = 2.0
@@ -55,16 +55,48 @@ def _make_handler(conn_factory):
                                   "manifest": manifest.MANIFEST})
         if req.get("v") != protocol.VERSION:
             return protocol.pack(protocol.err("bad_version", req))
-        if req.get("op") != protocol.OP_SEARCH:
+        op = req.get("op")
+
+        # Click promotion: log an opened result so it ranks up over time.
+        if op == protocol.OP_CLICK:
+            url = req.get("url")
+            if not url:
+                return protocol.pack(protocol.err("missing_field", req, "url"))
+            conn = None
+            try:
+                conn = conn_factory()
+                db.record_click(conn, url)
+            except Exception as e:  # noqa: BLE001
+                RNS.log(f"[beacon] click error: {e}", RNS.LOG_ERROR)
+                return protocol.pack(protocol.err("backend_error", req))
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            return protocol.pack(protocol.ok({}, req))
+
+        if op != protocol.OP_SEARCH:
             return protocol.pack(protocol.err("bad_op", req))
         q = req.get("q", "")
         if not q:
             return protocol.pack(protocol.err("missing_field", req, "q"))
+        limit = min(int(req.get("limit", 15) or 15), 30)
+        ptype = req.get("type")
         conn = None
         try:
             conn = conn_factory()
-            res = db.search(conn, q, min(int(req.get("limit", 15) or 15), 30),
-                            req.get("type"))
+            res = db.search(conn, q, limit, ptype)
+            # Federate the offline encyclopedia (unless a non-wiki type filter is
+            # set). Wiki hits get the same link-graph + click promotion by url, so
+            # a linked/opened article graduates into the ranked data.
+            if not ptype or ptype == "wiki":
+                for w in federate.wiki_search(q, min(limit, 6)):
+                    w["score"] = round(w.get("score", 0) + db.rank_bonus(conn, w["url"]), 5)
+                    res.append(w)
+            res.sort(key=lambda r: r.get("score", 0), reverse=True)
+            res = res[:limit]
         except Exception as e:  # noqa: BLE001
             RNS.log(f"[beacon] search error: {e}", RNS.LOG_ERROR)
             return protocol.pack(protocol.err("backend_error", req))

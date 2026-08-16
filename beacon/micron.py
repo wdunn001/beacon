@@ -20,7 +20,11 @@ def extract_links(text, node_hash):
     out = []
     seen = set()
     for m in _LINK_RE.finditer(text or ""):
-        target = m.group(2).strip()
+        # group(2) is "dest`field1=v1|field2=v2" -- split dest from link fields.
+        raw = m.group(2)
+        parts = raw.split("`")
+        target = parts[0].strip()
+        fields = parts[1] if len(parts) > 1 else ""
         if not target or target.startswith(("http://", "https://", "lxmf@", "mailto:")):
             continue
         nh, path = node_hash, None
@@ -34,7 +38,13 @@ def extract_links(text, node_hash):
                 nh, path = h.lower(), p
         if not path or not path.startswith("/page/"):
             continue
-        to_url = f"{nh}:{path}"
+        # a dynamic reader link (read.mu?ref=…) is one distinct target per ref;
+        # fold ref into the url so link-graph counting matches federated results.
+        ref = None
+        for kv in fields.split("|"):
+            if kv.startswith("ref="):
+                ref = kv[4:].strip()
+        to_url = f"{nh}:{path}" + (f"#{ref}" if ref else "")
         if to_url in seen:
             continue
         seen.add(to_url)

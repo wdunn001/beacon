@@ -8,8 +8,9 @@ ASPECTS = ("query",)
 PATH = "q"
 VERSION = 1
 
-OP_SEARCH = "search"     # {q, limit?, type?} -> {res:[{url,node_hash,path,title,type,node_name,description,snippet,md,score}]}
-OPS = frozenset((OP_SEARCH,))
+OP_SEARCH = "search"     # {q, limit?, type?} -> {res:[{url,node_hash,path,ref?,title,type,node_name,description,snippet,md,score}]}
+OP_CLICK = "click"       # {url} -> {ok}   (promotes the result in ranking)
+OPS = frozenset((OP_SEARCH, OP_CLICK))
 
 MANIFEST_OP = "__manifest__"
 
