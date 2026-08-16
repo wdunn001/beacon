@@ -70,9 +70,20 @@ def connect():
     )
 
 
+MIGRATIONS = r"""
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS type        TEXT;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS lang        TEXT;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS tags        TEXT[];
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS md_declared BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS pages_type_idx ON pages (type);
+"""
+
+
 def init_schema(conn):
     with conn, conn.cursor() as c:
         c.execute(SCHEMA)
+        c.execute(MIGRATIONS)
 
 
 def upsert_node(conn, dest_hash, name):
@@ -124,16 +135,22 @@ def drop_queue(conn, url):
         c.execute("DELETE FROM crawl_queue WHERE url = %s", (url,))
 
 
-def record_page(conn, url, node_hash, path, title, content, content_hash, nbytes, ok=True):
+def record_page(conn, url, node_hash, path, title, content, content_hash, nbytes,
+                ok=True, ptype=None, description=None, lang=None, tags=None,
+                md_declared=False):
     with conn, conn.cursor() as c:
         c.execute(
-            """INSERT INTO pages (url, node_hash, path, title, content, content_hash, bytes, ok, fetched_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
+            """INSERT INTO pages (url, node_hash, path, title, content, content_hash,
+                                  bytes, ok, type, description, lang, tags, md_declared, fetched_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
                ON CONFLICT (url) DO UPDATE
                  SET title=EXCLUDED.title, content=EXCLUDED.content,
                      content_hash=EXCLUDED.content_hash, bytes=EXCLUDED.bytes,
-                     ok=EXCLUDED.ok, fetched_at=now()""",
-            (url, node_hash, path, title, content, content_hash, nbytes, ok),
+                     ok=EXCLUDED.ok, type=EXCLUDED.type, description=EXCLUDED.description,
+                     lang=EXCLUDED.lang, tags=EXCLUDED.tags, md_declared=EXCLUDED.md_declared,
+                     fetched_at=now()""",
+            (url, node_hash, path, title, content, content_hash, nbytes, ok,
+             ptype, description, lang, tags, md_declared),
         )
 
 
@@ -177,4 +194,30 @@ def stats(conn):
         c.execute("SELECT count(*) FROM links"); out["links"] = c.fetchone()[0]
         c.execute("SELECT count(*) FROM crawl_queue WHERE next_attempt <= now()"); out["queue_due"] = c.fetchone()[0]
         c.execute("SELECT count(*) FROM crawl_queue"); out["queue_total"] = c.fetchone()[0]
+        c.execute("SELECT count(*) FROM pages WHERE md_declared"); out["md_declared"] = c.fetchone()[0]
         return out
+
+
+def categories(conn):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT coalesce(type,'(none)') t, count(*) n FROM pages WHERE ok "
+                  "GROUP BY 1 ORDER BY 2 DESC")
+        return [{"type": r[0], "count": r[1]} for r in c.fetchall()]
+
+
+def recent_pages(conn, limit=25):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT url, coalesce(title,'(untitled)'), coalesce(type,'?'), "
+                  "md_declared, fetched_at FROM pages WHERE ok "
+                  "ORDER BY fetched_at DESC LIMIT %s", (limit,))
+        return [{"url": r[0], "title": r[1], "type": r[2], "declared": r[3],
+                 "fetched_at": r[4].isoformat() if r[4] else None} for r in c.fetchall()]
+
+
+def top_nodes(conn, limit=15):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT coalesce(name,'(unnamed)'), dest_hash, announce_count, "
+                  "last_seen FROM nodes ORDER BY announce_count DESC, last_seen DESC LIMIT %s",
+                  (limit,))
+        return [{"name": r[0], "hash": r[1], "announces": r[2],
+                 "last_seen": r[3].isoformat() if r[3] else None} for r in c.fetchall()]

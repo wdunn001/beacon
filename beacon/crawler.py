@@ -11,6 +11,7 @@ import threading
 import time
 
 import RNS
+import meshdata
 
 from . import db, micron
 
@@ -120,10 +121,14 @@ def _process(conn, item):
         return
     data = data[:MAX_PAGE_BYTES]
     raw = data.decode("utf-8", "replace")
-    title = micron.title_of(raw)
+    md = meshdata.describe(raw, path)                     # MeshData if declared, else inferred
+    title = md.get("title") or micron.title_of(raw)
     text = micron.to_text(raw)
     chash = hashlib.sha256(data).hexdigest()
-    db.record_page(conn, url, node_hash, path, title, text, chash, len(data), ok=True)
+    db.record_page(conn, url, node_hash, path, title, text, chash, len(data), ok=True,
+                   ptype=md.get("type"), description=md.get("description"),
+                   lang=md.get("lang"), tags=md.get("tags"),
+                   md_declared=bool(meshdata.parse(raw)))
     edges = micron.extract_links(raw, node_hash)
     db.record_links(conn, url, edges)
     for to_url, nh, p in edges:

@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "wdunn001" }]
 requires-python = ">=3.9"
-dependencies = ["rns", "umsgpack", "psycopg2-binary"]
+dependencies = ["rns", "umsgpack", "psycopg2-binary", "meshdata @ git+https://github.com/wdunn001/meshdata@main"]
 
 [project.urls]
 Homepage = "https://github.com/wdunn001/beacon"
