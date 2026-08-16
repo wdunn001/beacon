@@ -20,8 +20,10 @@ MANIFEST = {
          "auth": "none",
          "request": {
              "q": {"type": "str!", "desc": "free-text query (supports quoted phrases, OR, -term)"},
-             "limit": {"type": "int<=30", "desc": "max results (default 15)"},
+             "limit": {"type": "int<=20", "desc": "page size (results per page, default 10)"},
+             "offset": {"type": "int?", "desc": "results to skip for pagination (default 0)"},
              "type": {"type": "str?", "desc": "filter by MeshData page type, e.g. article, news, index"}},
-         "response": "[{url,node_hash,path,title,type,node_name,description,snippet,md,score}]"},
+         "response": "{res:[{url,node_hash,path,title,type,node_name,description,snippet,md,score}], "
+                     "total:int, offset:int, limit:int, suggestion:str?}"},
     ],
 }

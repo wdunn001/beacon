@@ -17,6 +17,10 @@ from . import db, federate, manifest, protocol
 ANNOUNCE_INTERVAL = 900
 PER_LINK_RPS = 2.0
 PER_LINK_BURST = 6
+# Max results retained per query; pages are sliced from this ranked set so `total`
+# and prev/next stay stable. Plenty for mesh-scale search.
+SEARCH_CAP = 60
+WIKI_CAP = 18       # federated encyclopedia hits folded into the ranked set
 
 _dest_hash_hex = None
 _buckets = {}
@@ -82,25 +86,37 @@ def _make_handler(conn_factory):
         q = req.get("q", "")
         if not q:
             return protocol.pack(protocol.err("missing_field", req, "q"))
-        limit = min(int(req.get("limit", 15) or 15), 30)
+        page_size = min(int(req.get("limit", 10) or 10), 20)   # results per page
+        offset = max(int(req.get("offset", 0) or 0), 0)
         ptype = req.get("type")
         conn = None
         try:
             conn = conn_factory()
-            res = db.search(conn, q, limit, ptype)
+            # Rank the full result set once (capped), then paginate over it -- so
+            # `total` is accurate and prev/next are stable across page requests.
+            res = db.search(conn, q, SEARCH_CAP, ptype)
             # Federate the offline encyclopedia (unless a non-wiki type filter is
             # set). Wiki hits get the same link-graph + click promotion by url, so
             # a linked/opened article graduates into the ranked data.
             if not ptype or ptype == "wiki":
-                for w in federate.wiki_search(q, min(limit, 6)):
+                for w in federate.wiki_search(q, WIKI_CAP):
                     w["score"] = round(w.get("score", 0) + db.rank_bonus(conn, w["url"]), 5)
                     res.append(w)
-            res.sort(key=lambda r: r.get("score", 0), reverse=True)
-            res = res[:limit]
-            # "Did you mean?": when results are thin, offer a spell-corrected query
-            # (pg_trgm nearest corpus term). Cheap, and only when it would help.
+            # Dedup by url (a wiki article can also be a crawled page), keep best score.
+            best = {}
+            for r in res:
+                u = r.get("url")
+                if u is None:
+                    continue
+                if u not in best or r.get("score", 0) > best[u].get("score", 0):
+                    best[u] = r
+            merged = sorted(best.values(), key=lambda r: r.get("score", 0), reverse=True)
+            total = len(merged)
+            page = merged[offset:offset + page_size]
+            # "Did you mean?": when the whole result set is thin, offer a spell-
+            # corrected query (pg_trgm nearest corpus term). Only on the first page.
             suggestion = None
-            if len(res) < 3:
+            if total < 3 and offset == 0:
                 try:
                     suggestion = db.suggest(conn, q)
                 except Exception as e:  # noqa: BLE001
@@ -116,7 +132,7 @@ def _make_handler(conn_factory):
                     conn.close()
                 except Exception:
                     pass
-        payload = {"res": res}
+        payload = {"res": page, "total": total, "offset": offset, "limit": page_size}
         if suggestion:
             payload["suggestion"] = suggestion
         return protocol.pack(protocol.ok(payload, req))
