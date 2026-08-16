@@ -8,7 +8,14 @@ ASPECTS = ("query",)
 PATH = "q"
 VERSION = 1
 
-OP_SEARCH = "search"     # {q, limit?, type?} -> {res:[{url,node_hash,path,ref?,title,type,node_name,description,snippet,md,score}]}
+OP_SEARCH = "search"     # {q, limit?, type?} -> {res:[{url,node_hash,path,ref?,title,type,
+                          #   node_name,description,snippet,md,score,date?,also_on?,more_from_node?}]}
+                          # snippet may contain \x01/\x02 sentinel pairs marking the matched-term
+                          # span (protocol-level, never raw micron control codes -- the client
+                          # renders them, e.g. as a bold toggle). date = effective content date
+                          # (ISO YYYY-MM-DD) when known. also_on = N other nodes collapsed into
+                          # this result (canonical/content-hash dedup). more_from_node = N more
+                          # results from this same node held back by the per-page crowding cap.
 OP_CLICK = "click"       # {url} -> {ok}   (promotes the result in ranking)
 OPS = frozenset((OP_SEARCH, OP_CLICK))
 

@@ -9,6 +9,7 @@ bucket and DB LIMIT.
 import os
 import threading
 import time
+from collections import deque
 
 import RNS
 
@@ -42,6 +43,76 @@ def _allow(link_id):
             return True
         _buckets[key] = (tokens, now)
         return False
+
+
+NODE_CROWD_CAP = 3
+_INTERNAL_ONLY_FIELDS = ("content_hash", "canonical")   # server-side dedup keys, never sent over the wire
+
+
+def _apply_node_crowding(rows, cap=NODE_CROWD_CAP, window=10):
+    """Greedily reorder so no `window`-sized SLIDING span of the output has
+    more than `cap` items from the same node_hash -- a stronger guarantee
+    than per-bucket capping (which breaks once a bucket under-fills: the next
+    bucket's items land at the wrong absolute offset and a fixed-size page
+    slice can straddle two crowded buckets). At each output position, take
+    the highest-ranked remaining item whose node_hash count in the trailing
+    `window` PLACED items is still under `cap`; only when literally nothing
+    remaining qualifies (every remaining item is from an already-capped node
+    -- i.e. fewer than `cap`+1 distinct nodes have any relevant content left)
+    does it fall back to the next-best item anyway. Never drops anything, so
+    `total` stays accurate. Diverse content is pulled to the FRONT of the
+    list; if it runs out entirely, later pages legitimately fall back to the
+    crowded node (there's nothing else to show) -- but page 1, the one
+    anyone actually reads, gets the spread as long as it exists anywhere.
+
+    This is what makes "recent news" stop being ~all Wikipedia: every wiki
+    hit shares the SAME node_hash, so as long as a handful of OTHER nodes
+    have anything relevant, page 1 can never hold more than `cap` of them."""
+    remaining = list(rows)     # already rank-sorted desc
+    trailing = deque()         # node_hashes of the last `window` PLACED items
+    trailing_counts = {}
+    result = []
+    while remaining:
+        pick = 0
+        for i, r in enumerate(remaining):
+            if trailing_counts.get(r.get("node_hash"), 0) < cap:
+                pick = i
+                break
+        item = remaining.pop(pick)
+        nh = item.get("node_hash")
+        result.append(item)
+        trailing.append(nh)
+        trailing_counts[nh] = trailing_counts.get(nh, 0) + 1
+        if len(trailing) > window:
+            old = trailing.popleft()
+            trailing_counts[old] -= 1
+            if trailing_counts[old] <= 0:
+                del trailing_counts[old]
+    return result
+
+
+def _annotate_more_from_node(merged, page_rows, page_end):
+    """Tag the last row of each node shown on THIS page with how many more
+    results from that same node exist further down the (fully-preserved)
+    ranked list -- a cheap "+N more from X" note, no extra query needed."""
+    after_counts = {}
+    for r in merged[page_end:]:
+        nh = r.get("node_hash")
+        after_counts[nh] = after_counts.get(nh, 0) + 1
+    out = [dict(r) for r in page_rows]
+    last_idx = {}
+    for i, r in enumerate(out):
+        last_idx[r.get("node_hash")] = i
+    for nh, cnt in after_counts.items():
+        idx = last_idx.get(nh)
+        if idx is not None:
+            out[idx]["more_from_node"] = cnt
+    return out
+
+
+def _public_fields(r):
+    """Strip server-only dedup keys before a result crosses the wire."""
+    return {k: v for k, v in r.items() if k not in _INTERNAL_ONLY_FIELDS}
 
 
 def _make_handler(conn_factory):
@@ -102,17 +173,40 @@ def _make_handler(conn_factory):
                 for w in federate.wiki_search(q, WIKI_CAP):
                     w["score"] = round(w.get("score", 0) + db.rank_bonus(conn, w["url"]), 5)
                     res.append(w)
-            # Dedup by url (a wiki article can also be a crawled page), keep best score.
-            best = {}
+            # Dedup: collapse rows sharing a MeshData `canonical` URL (author-
+            # declared "this is the same page") OR an exact content_hash (a
+            # mirror re-serving byte-identical content on another node) into
+            # one result -- highest score wins. Falls back to a bare-url key
+            # (the old behaviour) for rows with neither, e.g. federated wiki
+            # hits, which carry no content_hash.
+            groups = {}
             for r in res:
                 u = r.get("url")
                 if u is None:
                     continue
-                if u not in best or r.get("score", 0) > best[u].get("score", 0):
-                    best[u] = r
-            merged = sorted(best.values(), key=lambda r: r.get("score", 0), reverse=True)
+                key = r.get("canonical") or r.get("content_hash") or u
+                groups.setdefault(key, []).append(r)
+            deduped = []
+            for rows in groups.values():
+                rows.sort(key=lambda r: r.get("score", 0), reverse=True)
+                winner = dict(rows[0])
+                if len(rows) > 1:
+                    winner["also_on"] = len(rows) - 1   # dim "also on N other nodes" note
+                deduped.append(winner)
+            merged = sorted(deduped, key=lambda r: r.get("score", 0), reverse=True)
+            # Node crowding cap: at most NODE_CROWD_CAP results per source node
+            # in any page_size-sized window (bucketed per THIS request's page
+            # size -- see _apply_node_crowding's docstring for why a single
+            # global reorder isn't enough). Never drops anything -- `total`
+            # stays accurate and later pages still reach the deferred items.
+            # This is what makes "recent news" stop being ~all Wikipedia:
+            # every wiki hit shares the SAME node_hash, so at most 3 of them
+            # can ever land in one page's window.
+            merged = _apply_node_crowding(merged, window=page_size)
             total = len(merged)
-            page = merged[offset:offset + page_size]
+            page_end = offset + page_size
+            page_rows = _annotate_more_from_node(merged, merged[offset:page_end], page_end)
+            page = [_public_fields(r) for r in page_rows]
             # "Did you mean?": when the whole result set is thin, offer a spell-
             # corrected query (pg_trgm nearest corpus term). Only on the first page.
             suggestion = None

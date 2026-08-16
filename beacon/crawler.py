@@ -13,6 +13,7 @@ import time
 import RNS
 import meshdata
 
+from . import dates as _dates
 from . import db, micron
 
 NODE_APP = "nomadnetwork"
@@ -139,14 +140,28 @@ def _process(conn, item):
         return
     data = data[:MAX_PAGE_BYTES]
     raw = data.decode("utf-8", "replace")
-    md = meshdata.describe(raw, path)                     # MeshData if declared, else inferred
+    # Declared MeshData vs the STRUCTURAL fallback are computed independently
+    # (not just meshdata.describe's declared-or-inferred merge) so ranking can
+    # cross-check one against the other -- a declared type that wildly
+    # contradicts the page's actual shape is an adversarial-surface concern
+    # now that MeshData feeds ranking (see db.search's _rank_type).
+    declared = meshdata.parse(raw)
+    structural = meshdata.infer(raw, path)
+    md = declared if declared else structural
+    md.setdefault("type", "index")
+    inferred_type = structural.get("type")
     title = md.get("title") or micron.title_of(raw)
     text = micron.to_text(raw)
+    heads = micron.headings_of(raw)
     chash = hashlib.sha256(data).hexdigest()
+    md_date = _dates.effective_declared_date(md)
+    canonical = (md.get("canonical") or "").strip() or None
     db.record_page(conn, url, node_hash, path, title, text, chash, len(data), ok=True,
                    ptype=md.get("type"), description=md.get("description"),
                    lang=md.get("lang"), tags=md.get("tags"),
-                   md_declared=bool(meshdata.parse(raw)), fetch_ms=fetch_ms)
+                   md_declared=bool(declared), fetch_ms=fetch_ms,
+                   md_date=md_date, canonical=canonical, headings=heads,
+                   inferred_type=inferred_type)
     edges = micron.extract_links(raw, node_hash)
     db.record_links(conn, url, edges)
     # Deep pages of our own nodes crawl right after our indexes (prio 2), ahead of

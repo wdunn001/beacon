@@ -71,6 +71,26 @@ def to_text(raw):
     return t.strip()
 
 
+_HEAD_LINE = re.compile(r"^\s*>+\s*(.+)$")
+
+
+def headings_of(raw):
+    """All micron heading-line text ('>' lines), newline-joined -- the tsvector
+    weight-B field (between title and body): a heading match should outrank a
+    body match but not a title match."""
+    out = []
+    for line in (raw or "").splitlines():
+        m = _HEAD_LINE.match(line)
+        if not m:
+            continue
+        s = _COLOR_RE.sub("", m.group(1))
+        s = _LINK_RE.sub(lambda mm: mm.group(1), s)
+        s = _CTRL_RE.sub("", s).replace("`", "").strip()
+        if s:
+            out.append(s)
+    return "\n".join(out)
+
+
 def title_of(raw):
     """First heading line (starts with '>'), else first non-empty text line."""
     for line in (raw or "").splitlines():
