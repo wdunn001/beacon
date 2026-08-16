@@ -164,27 +164,54 @@ def _process(conn, item):
     RNS.log(f"[beacon] crawled {url} ({len(data)}B, {len(edges)} links)", RNS.LOG_VERBOSE)
 
 
-def crawl_loop(conn_factory):
+CRAWL_WORKERS = int(os.environ.get("BEACON_CRAWL_WORKERS", "6"))
+
+
+def _recrawl_loop(conn_factory):
     conn = conn_factory()
-    last_recrawl = 0
     while True:
         try:
-            if time.time() - last_recrawl > 3600:
-                db.enqueue_recrawl(conn, RECRAWL_HOURS)
-                last_recrawl = time.time()
-            items = db.due_items(conn, limit=1)
-            if not items:
-                time.sleep(5)
-                continue
-            _process(conn, items[0])
-            time.sleep(FETCH_DELAY)
+            db.enqueue_recrawl(conn, RECRAWL_HOURS)
         except Exception as e:  # noqa: BLE001
-            RNS.log(f"[beacon] crawl loop error: {e}", RNS.LOG_ERROR)
-            time.sleep(10)
+            RNS.log(f"[beacon] recrawl error: {e}", RNS.LOG_DEBUG)
             try:
                 conn = conn_factory()
             except Exception:
                 pass
+        time.sleep(3600)
+
+
+def _worker(conn_factory, wid):
+    conn = conn_factory()
+    while True:
+        try:
+            item = db.claim_item(conn, lease_s=int(LINK_TIMEOUT * 3 + 30))
+            if not item:
+                time.sleep(3)
+                continue
+            _process(conn, item)
+            time.sleep(FETCH_DELAY)      # per-worker politeness
+        except Exception as e:  # noqa: BLE001
+            RNS.log(f"[beacon] worker {wid} error: {e}", RNS.LOG_ERROR)
+            time.sleep(5)
+            try:
+                conn = conn_factory()
+            except Exception:
+                pass
+
+
+def crawl_loop(conn_factory):
+    """Concurrent crawler: a pool of workers each atomically leases due items
+    (SKIP LOCKED), so a slow/unreachable page no longer stalls the whole crawl."""
+    threading.Thread(target=_recrawl_loop, args=(conn_factory,), daemon=True).start()
+    workers = []
+    for i in range(max(1, CRAWL_WORKERS)):
+        t = threading.Thread(target=_worker, args=(conn_factory, i), daemon=True)
+        t.start()
+        workers.append(t)
+    RNS.log(f"[beacon] crawl pool: {len(workers)} workers, delay {FETCH_DELAY}s, timeout {LINK_TIMEOUT}s")
+    for t in workers:
+        t.join()
 
 
 def stats():

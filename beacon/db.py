@@ -129,6 +129,23 @@ def due_items(conn, limit=1):
         return c.fetchall()
 
 
+def claim_item(conn, lease_s=180):
+    """Atomically lease one due item for a worker (FOR UPDATE SKIP LOCKED), bumping
+    its next_attempt so no other worker grabs it. Enables concurrent crawlers.
+    Returns the item dict or None. _process later drops it on success or reschedules."""
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+        c.execute(
+            """UPDATE crawl_queue SET next_attempt = now() + (%s || ' seconds')::interval
+               WHERE url = (
+                   SELECT url FROM crawl_queue WHERE next_attempt <= now()
+                   ORDER BY priority ASC, next_attempt ASC
+                   FOR UPDATE SKIP LOCKED LIMIT 1)
+               RETURNING url, node_hash, path, attempts""",
+            (int(lease_s),),
+        )
+        return c.fetchone()
+
+
 def reschedule(conn, url, delay_s, ok):
     with conn, conn.cursor() as c:
         c.execute(
