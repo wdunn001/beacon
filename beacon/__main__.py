@@ -6,7 +6,7 @@ import time
 
 import RNS
 
-from . import crawler, db, web
+from . import crawler, db, searchd, web
 
 
 def main():
@@ -33,6 +33,11 @@ def main():
     handler = crawler._NodeAnnounceHandler(conn_factory)
     RNS.Transport.register_announce_handler(handler)
     RNS.log("[beacon] listening for nomadnetwork.node announces")
+
+    # Search service over Reticulum, on this same RNS instance (stable identity
+    # under /data so the dest hash survives restarts).
+    search_identity = os.environ.get("BEACON_SEARCH_IDENTITY", "/data/search-identity")
+    searchd.start(conn_factory, search_identity)
 
     web.start(conn_factory, args.http_port)
     RNS.log(f"[beacon] http on :{args.http_port}")

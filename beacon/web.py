@@ -6,7 +6,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import crawler, db
+from . import crawler, db, searchd
 
 
 def _dashboard_html(conn):
@@ -86,7 +86,8 @@ def start(conn_factory, port):
             try:
                 if route == "/healthz":
                     self._json(200, {"ok": True, "db": True, **db.stats(conn),
-                                     "crawler": crawler.stats()})
+                                     "crawler": crawler.stats(),
+                                     "search_dest": searchd.dest_hash()})
                 elif route == "/stats":
                     self._json(200, {**db.stats(conn), "crawler": crawler.stats(),
                                      "categories": db.categories(conn)})

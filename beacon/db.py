@@ -221,3 +221,53 @@ def top_nodes(conn, limit=15):
                   (limit,))
         return [{"name": r[0], "hash": r[1], "announces": r[2],
                  "last_seen": r[3].isoformat() if r[3] else None} for r in c.fetchall()]
+
+
+# Ranking = full-text relevance (ts_rank_cd) with two boosts the user asked for:
+#   * MeshData schema bonus -- a page that declares its type/description via
+#     MeshData is better-described and rewarded (+40%);
+#   * node-trust -- pages on nodes that announce more (more established) get a
+#     gentle log-scaled lift.
+# Uniqueness/value scoring is a later stage; this is the honest first cut.
+def search(conn, query, limit=15, ptype=None):
+    if not query or not query.strip():
+        return []
+    params = [query]
+    type_clause = ""
+    if ptype:
+        type_clause = " AND p.type = %s"
+        params.append(ptype)
+    params.append(limit)
+    sql = f"""
+        WITH q AS (SELECT websearch_to_tsquery('english', %s) AS tsq)
+        SELECT p.url, p.node_hash, p.path, coalesce(p.title,'(untitled)') AS title,
+               coalesce(p.type,'?') AS type, p.description, p.md_declared,
+               coalesce(n.name,'') AS node_name,
+               coalesce(n.announce_count,1) AS announces,
+               ts_rank_cd(p.content_tsv, q.tsq) AS rel,
+               ts_headline('english', coalesce(p.content,''), q.tsq,
+                   'MaxWords=30, MinWords=12, ShortWord=3, MaxFragments=1, StartSel=[, StopSel=]') AS snippet,
+               (ts_rank_cd(p.content_tsv, q.tsq)
+                 * (1.0 + 0.4*(p.md_declared)::int)
+                 * (1.0 + ln(1+coalesce(n.announce_count,1))*0.1)) AS score
+        FROM pages p
+        CROSS JOIN q
+        LEFT JOIN nodes n ON n.dest_hash = p.node_hash
+        WHERE p.ok AND p.content_tsv @@ q.tsq{type_clause}
+        ORDER BY score DESC
+        LIMIT %s
+    """
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+        c.execute(sql, params)
+        rows = c.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "url": r["url"], "node_hash": r["node_hash"], "path": r["path"],
+            "title": r["title"], "type": r["type"],
+            "node_name": r["node_name"], "md": bool(r["md_declared"]),
+            "description": (r["description"] or "").strip(),
+            "snippet": (r["snippet"] or "").strip(),
+            "score": round(float(r["score"]), 5),
+        })
+    return out
