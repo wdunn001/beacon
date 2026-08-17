@@ -73,8 +73,13 @@ def to_text(raw):
     lines = []
     for line in t.splitlines():
         s = line
-        if s[:1] in (">", "-", "#"):                    # section markers / dividers / comments
-            s = s.lstrip(">-#").strip()
+        if s.lstrip().startswith("#"):                  # micron comment line -- clients never
+            continue                                    # render it; this includes MeshData head
+        #                                                 blocks (`# +key: value`), so the raw
+        #                                                 schema no longer leaks into the indexed
+        #                                                 text / result snippet.
+        if s[:1] in (">", "-"):                         # heading text / divider marker
+            s = s.lstrip(">-").strip()
         s = s.replace("\\`", "`").replace("`", "")      # unescape + drop stray backticks
         lines.append(s)
     t = "\n".join(lines)
