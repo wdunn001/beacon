@@ -7,6 +7,7 @@ and recrawl each node's index at least daily.
 """
 import hashlib
 import os
+import re
 import threading
 import time
 
@@ -14,7 +15,7 @@ import RNS
 import meshdata
 
 from . import dates as _dates
-from . import db, micron
+from . import db, embed, micron
 
 NODE_APP = "nomadnetwork"
 NODE_ASPECT = "node"
@@ -24,6 +25,26 @@ RECRAWL_HOURS = int(os.environ.get("BEACON_RECRAWL_HOURS", "24"))
 MAX_PAGE_BYTES = int(os.environ.get("BEACON_MAX_PAGE_BYTES", str(512 * 1024)))
 BINARY_EXT = (".pdf", ".epub", ".zip", ".gz", ".png", ".jpg", ".jpeg", ".gif",
               ".webp", ".mp3", ".ogg", ".opus", ".mp4", ".bin", ".tar")
+
+_PRICE_RE = re.compile(r"[-+]?\d{1,9}(?:[.,]\d{1,2})?")
+
+
+def _parse_price(raw):
+    """Tolerant MeshData `price` parse (free-text like every other MeshData
+    field, see beacon.dates for the same posture on dates): pull the first
+    plausible decimal number out of it ("24.00", "$24.00", "24,00 EUR" all
+    work), else None -- never raises, never trusted beyond a ranking/display
+    signal."""
+    if not raw:
+        return None
+    m = _PRICE_RE.search(str(raw).replace(",", "."))
+    if not m:
+        return None
+    try:
+        v = float(m.group(0))
+    except ValueError:
+        return None
+    return v if 0 <= v < 10_000_000 else None
 
 _stats = {"fetched": 0, "ok": 0, "failed": 0, "started": time.time()}
 
@@ -156,18 +177,46 @@ def _process(conn, item):
     chash = hashlib.sha256(data).hexdigest()
     md_date = _dates.effective_declared_date(md)
     canonical = (md.get("canonical") or "").strip() or None
+    # Commerce fields (lever 3): only meaningful when the page declares
+    # type=product, but harmless to read off `md` regardless -- absent fields
+    # are just None. availability isn't validated against vocab.AVAILABILITY
+    # here (display-layer's job to fall back gracefully on an unknown value).
+    price = _parse_price(md.get("price"))
+    currency = (md.get("currency") or "").strip()[:8] or None
+    availability = (md.get("availability") or "").strip()[:32] or None
+    sku = (md.get("sku") or "").strip()[:64] or None
+    vendor = (md.get("vendor") or "").strip()[:120] or None
+    shop_dest = (md.get("shop") or "").strip()[:64] or None
+    # Index-time embedding (lever 4): best-effort, short timeout so a down
+    # embedder costs one fetch's worth of latency, not a stalled crawl -- see
+    # beacon.embed for the full graceful-degradation story.
+    embed_src = "\n".join(x for x in (title, md.get("description"), heads, text) if x)
+    vec = embed.embed_document(embed_src, timeout=5.0)
+    vec_literal = embed.to_vector_literal(vec) if vec else None
     db.record_page(conn, url, node_hash, path, title, text, chash, len(data), ok=True,
                    ptype=md.get("type"), description=md.get("description"),
                    lang=md.get("lang"), tags=md.get("tags"),
                    md_declared=bool(declared), fetch_ms=fetch_ms,
                    md_date=md_date, canonical=canonical, headings=heads,
-                   inferred_type=inferred_type)
+                   inferred_type=inferred_type, price=price, currency=currency,
+                   availability=availability, sku=sku, vendor=vendor,
+                   shop_dest=shop_dest, embedding=vec_literal)
     edges = micron.extract_links(raw, node_hash)
     db.record_links(conn, url, edges)
+    # Anchor text (lever 1): fold this crawl's outbound link labels into each
+    # TARGET page's `anchors` column right away, rather than waiting for the
+    # hourly sweep (_recrawl_loop also runs a full refresh_anchors() as a
+    # backstop/catch-up for targets that weren't in `pages` yet at link time).
+    anchor_targets = [to_url for to_url, nh, p, label in edges if label]
+    if anchor_targets:
+        try:
+            db.refresh_anchors(conn, urls=anchor_targets)
+        except Exception as e:  # noqa: BLE001
+            RNS.log(f"[beacon] refresh_anchors error: {e}", RNS.LOG_DEBUG)
     # Deep pages of our own nodes crawl right after our indexes (prio 2), ahead of
     # the external index backlog (prio 3); external deep pages stay at prio 6.
     deep_prio = SEED_DEEP_PRIO if node_hash in SEED_NODES else DEEP_PRIO
-    for to_url, nh, p in edges:
+    for to_url, nh, p, label in edges:
         # Record every edge (link-graph ranking), but don't ENQUEUE dynamic
         # reader pages -- read.mu needs a ref/field, so crawling it bare is junk.
         if not _is_binary(p) and not p.endswith("/read.mu"):
@@ -190,6 +239,7 @@ def _recrawl_loop(conn_factory):
         try:
             db.enqueue_recrawl(conn, RECRAWL_HOURS)
             db.refresh_lexicon(conn)      # keep the "did you mean?" lexicon current
+            db.refresh_anchors(conn)      # catch-up sweep for lever 1 (see _process)
         except Exception as e:  # noqa: BLE001
             RNS.log(f"[beacon] recrawl error: {e}", RNS.LOG_DEBUG)
             try:
@@ -197,6 +247,45 @@ def _recrawl_loop(conn_factory):
             except Exception:
                 pass
         time.sleep(3600)
+
+
+# Resumable, throttled backfill of `embedding` for pages that predate lever 4
+# (or whose crawl-time embed attempt failed). Progress is the DB itself
+# (WHERE embedding IS NULL) so a restart just continues; failures are skipped
+# gracefully (row stays NULL, retried on a later pass) rather than raising or
+# wedging the loop. Separate from the crawl workers so a slow/degraded
+# embedder never competes with crawl throughput for FETCH_DELAY's budget.
+EMBED_BACKFILL_BATCH = int(os.environ.get("BEACON_EMBED_BACKFILL_BATCH", "20"))
+EMBED_BACKFILL_DELAY = float(os.environ.get("BEACON_EMBED_BACKFILL_DELAY", "0.5"))
+
+
+def _embed_backfill_loop(conn_factory):
+    conn = conn_factory()
+    while True:
+        try:
+            rows = db.pages_needing_embedding(conn, EMBED_BACKFILL_BATCH)
+            if not rows:
+                time.sleep(300)     # fully caught up; new crawls trickle in, check back later
+                continue
+            done = 0
+            for r in rows:
+                src = "\n".join(x for x in (r["title"], r["description"], r["headings"],
+                                            r["content"]) if x)
+                vec = embed.embed_document(src)
+                if vec:
+                    db.set_embedding(conn, r["id"], embed.to_vector_literal(vec))
+                    done += 1
+                time.sleep(EMBED_BACKFILL_DELAY)
+            RNS.log(f"[beacon] embed backfill: {done}/{len(rows)} this batch", RNS.LOG_DEBUG)
+            if done == 0:
+                time.sleep(120)     # embedder likely down -- back off harder than a normal pass
+        except Exception as e:  # noqa: BLE001
+            RNS.log(f"[beacon] embed backfill error: {e}", RNS.LOG_ERROR)
+            time.sleep(30)
+            try:
+                conn = conn_factory()
+            except Exception:
+                pass
 
 
 def _worker(conn_factory, wid):
@@ -222,6 +311,7 @@ def crawl_loop(conn_factory):
     """Concurrent crawler: a pool of workers each atomically leases due items
     (SKIP LOCKED), so a slow/unreachable page no longer stalls the whole crawl."""
     threading.Thread(target=_recrawl_loop, args=(conn_factory,), daemon=True).start()
+    threading.Thread(target=_embed_backfill_loop, args=(conn_factory,), daemon=True).start()
     workers = []
     for i in range(max(1, CRAWL_WORKERS)):
         t = threading.Thread(target=_worker, args=(conn_factory, i), daemon=True)

@@ -6,6 +6,9 @@
     GET  /stats       -> stats JSON
     POST /ev          -> Beacon-Analytics RUM ingest (page-view events from our
                          NomadNet nodes over fast localhost HTTP)
+    GET  /go          -> click-through redirect for web-originated result clicks
+                         (lever 2 -- see _go's docstring for why this exists and
+                         why mesh clicks CAN'T use the same mechanism)
 
   analytics server (BEACON_ANALYTICS_PORT, default 8218) -> rns-analytics.quasarke.net
     GET  /            -> Beacon-Analytics dashboard (charts, analytics only)
@@ -20,6 +23,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, parse_qs
 
 from . import crawler, db, searchd
 
@@ -125,12 +129,20 @@ def _analytics_html(conn):
     ss = db.search_stats(conn)
     top_q = db.top_searches(conn, 15)
     zero_q = db.zero_result_searches(conn, 15)
+    wc = db.click_event_stats(conn)          # lever 2: real web click-through data
+    top_clicks = db.top_clicked(conn, 15)
+    emb = db.embedding_backlog_count(conn)   # lever 4: hybrid vector backfill progress
 
     cards = "".join(
         f'<div class=c><div class=n>{_esc(f"{v:,}")}</div><div class=l>{_esc(k)}</div></div>'
         for k, v in [("page views", rum["events"]), ("unique visitors", rum["visitors"]),
                      ("views 24h", rum["events_24h"]), ("active nodes", len(nodes)),
-                     ("searches", ss["searches"]), ("zero-result", ss["zero_result"])])
+                     ("searches", ss["searches"]), ("zero-result", ss["zero_result"]),
+                     ("web clicks", wc["clicks"]), ("web clicks 24h", wc["clicks_24h"]),
+                     ("embedded", emb["embedded"]), ("embed backlog", emb["backlog"])])
+    clickrows = "".join(
+        f'<tr><td class=m>{_esc(c["url"][:56])}</td><td class=r>{c["clicks"]:,}</td></tr>'
+        for c in top_clicks)
 
     topqrows = "".join(
         f'<tr><td>{_esc(s["q"][:48])}</td><td class=r>{s["count"]:,}</td>'
@@ -176,6 +188,15 @@ hashed &middot; no identities stored &middot; auto-refresh 60s</p>
 {zeroqrows or '<tr><td class=m colspan=2>none yet; every query found something</td></tr>'}
 </table></div></div>
 </div>
+
+<h2>Web click-through &middot; the real data behind ln(clicks)</h2>
+<p class=sub style="margin-top:-8px">only the web /go redirect can log a click natively; mesh
+results deep-link straight to the target page (no interstitial hop), so mesh search only
+contributes query+impressions, never a click &mdash; see beacon.web._go</p>
+<div class=panel><table>
+<tr><th>result url</th><th class=r>clicks</th></tr>
+{clickrows or '<tr><td class=m colspan=2>no web clicks yet</td></tr>'}
+</table></div>
 <p class=sub style="margin-top:24px">&#9673; Beacon &middot; <a href="//crawler.quasarke.net">crawler dashboard</a></p>
 </body></html>"""
 
@@ -313,25 +334,73 @@ def start(conn_factory, port, analytics_port=None):
                     self.end_headers()
 
             def do_GET(self):
-                route = self.path.rstrip("/") or "/"
+                parsed = urlsplit(self.path)
+                route = parsed.path.rstrip("/") or "/"
                 try:
                     with lock:
                         if route == "/healthz":
                             base = {"ok": True, "db": True, "rum": db.rum_stats(conn)}
                             if allow_ingest:
                                 base.update({**db.stats(conn), "crawler": crawler.stats(),
-                                             "search_dest": searchd.dest_hash()})
+                                             "search_dest": searchd.dest_hash(),
+                                             "embedding": db.embedding_backlog_count(conn),
+                                             "web_clicks": db.click_event_stats(conn)})
                             self._json(200, base)
                         elif route == "/stats" and allow_ingest:
                             self._json(200, {**db.stats(conn), "crawler": crawler.stats(),
                                              "categories": db.categories(conn),
-                                             "rum": db.rum_stats(conn)})
+                                             "rum": db.rum_stats(conn),
+                                             "embedding": db.embedding_backlog_count(conn),
+                                             "web_clicks": db.click_event_stats(conn),
+                                             "top_clicked": db.top_clicked(conn, 15)})
+                        elif route == "/go" and allow_ingest:
+                            qs = parse_qs(parsed.query)
+                            self._go(qs, conn)
                         elif route == "/":
                             self._html(200, root_renderer(conn))
                         else:
                             self._json(404, {"ok": False, "err": "not_found"})
                 except Exception as e:  # noqa: BLE001
                     self._json(503, {"ok": False, "db": False, "err": str(e)})
+
+            def _go(self, qs, conn):
+                """Click-through redirect for the ONE surface that can log a real
+                click without adding a hop: a web browser following a normal link.
+                (The NomadNet search page deep-links straight to a result's page --
+                see git history "drop click-through interstitial" -- so on the mesh
+                Beacon can only log query+impressions, not clicks; see
+                db.record_search's `urls` param. This endpoint is that surface's
+                counterpart: for anything that renders Beacon results as plain HTTP
+                links, /go?url=<result url>&q=<query> logs the click -- feeding the
+                REAL data behind the ln(clicks) ranking term -- then redirects.)
+
+                `url` MUST already be a known crawled page (looked up below) --
+                otherwise this would be an open redirect (a spam/phishing vector),
+                which a public-facing endpoint must never be regardless of how
+                low-traffic it is today.
+
+                Redirect target: NomadNet pages have no clearnet URL in general
+                (that's what the still-pending "RDNS gateway" is for), so the only
+                HONEST redirect target is the page's own declared MeshData
+                `canonical` (an author-supplied clearnet URL) when present; failing
+                that, back to the dashboard root. This is a real, if narrow,
+                limitation -- documented here rather than faked with a redirect to
+                nowhere useful."""
+                url = (qs.get("url") or [""])[0].strip()
+                q = (qs.get("q") or [""])[0]
+                row = db.page_by_url(conn, url) if url else None
+                if not row:
+                    self._json(404, {"ok": False, "err": "unknown_url"})
+                    return
+                try:
+                    db.record_click_event(conn, url, q)
+                except Exception:  # noqa: BLE001 -- logging must never block the redirect
+                    pass
+                dest = row.get("canonical") or "/"
+                self.send_response(302)
+                self.send_header("Location", dest)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
 
             def log_message(self, *a):
                 pass

@@ -15,11 +15,23 @@ _CTRL_RE = re.compile(r"`[a-zA-Z!_=\*<>]")
 _HEX = re.compile(r"^[0-9a-f]{16,64}$", re.I)
 
 
+def _clean_label(label):
+    """Strip color/control codes from a link's visible anchor text, same
+    treatment as headings_of/title_of -- this is what feeds anchor-text
+    indexing (lever 1), so it needs to be plain, readable text, not raw
+    micron markup."""
+    s = _COLOR_RE.sub("", label or "")
+    s = _CTRL_RE.sub("", s).replace("`", "").strip()
+    return s[:200] or None
+
+
 def extract_links(text, node_hash):
-    """Return [(to_url, to_node_hash, to_path)] for in-mesh page links only."""
+    """Return [(to_url, to_node_hash, to_path, label)] for in-mesh page links
+    only. `label` is the link's cleaned visible anchor text (may be None)."""
     out = []
     seen = set()
     for m in _LINK_RE.finditer(text or ""):
+        label = _clean_label(m.group(1))
         # group(2) is "dest`field1=v1|field2=v2" -- split dest from link fields.
         raw = m.group(2)
         parts = raw.split("`")
@@ -48,7 +60,7 @@ def extract_links(text, node_hash):
         if to_url in seen:
             continue
         seen.add(to_url)
-        out.append((to_url, nh, path))
+        out.append((to_url, nh, path, label))
     return out
 
 

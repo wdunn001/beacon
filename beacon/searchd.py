@@ -219,9 +219,13 @@ def _make_handler(conn_factory):
                     suggestion = None
             # Search analytics: log the query + how many results it found (only the
             # first page request, so paging through results isn't double-counted).
+            # `urls` = the impressions -- the actual result set SHOWN for this
+            # query -- which is the mesh-side half of lever 2's click-through
+            # story (see db.record_search's docstring for why mesh can't log
+            # clicks the way beacon.web._go does for the web).
             if offset == 0:
                 try:
-                    db.record_search(conn, q, total, bool(suggestion))
+                    db.record_search(conn, q, total, bool(suggestion), urls=[r.get("url") for r in page])
                 except Exception as e:  # noqa: BLE001
                     RNS.log(f"[beacon] record_search error: {e}", RNS.LOG_DEBUG)
         except Exception as e:  # noqa: BLE001

@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS links (
     PRIMARY KEY (from_url, to_url)
 );
 CREATE INDEX IF NOT EXISTS links_to_idx ON links (to_url);
+-- NOTE: `label` (the micron link's visible anchor text, e.g. `[label`target])
+-- is added in MIGRATIONS below (NULL on a fresh DB too until the first crawl
+-- populates it -- keeping it out of the base SCHEMA avoids a second
+-- "IF NOT EXISTS" no-op path for new installs vs the migration path).
 
 CREATE TABLE IF NOT EXISTS crawl_queue (
     url           TEXT PRIMARY KEY,
@@ -184,11 +188,109 @@ BEGIN
     EXECUTE 'CREATE INDEX IF NOT EXISTS pages_tsv_idx ON pages USING GIN (content_tsv)';
   END IF;
 END $mig$;
+
+-- Ranking v3 levers ---------------------------------------------------------
+
+-- Lever 1: anchor text. `label` is the visible text of a `[label`target]`
+-- micron link -- NULL for every row inserted before this migration (and for
+-- any link whose author left the label empty). `anchors` is a page-level
+-- STORED aggregate of the labels of links pointing AT that page, refreshed
+-- periodically by refresh_anchors() below (a generated column can't reach
+-- across tables, so this can't be a normal GENERATED expression like
+-- headings/title -- it's maintained by an explicit UPDATE instead, same
+-- family of tradeoff as the click/link-graph counters).
+ALTER TABLE links ADD COLUMN IF NOT EXISTS label TEXT;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS anchors TEXT;
+
+-- Lever 3: MeshData commerce fields (type=product). Free-text like every
+-- other MeshData field -- price is tolerant-parsed (beacon.dates-style: bad
+-- value -> NULL, never an exception) before it reaches this column, so
+-- `price` is always a clean NUMERIC or NULL, never a raw string.
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS price        NUMERIC(12,2);
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS currency     TEXT;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS availability TEXT;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS sku          TEXT;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS vendor       TEXT;
+-- the seller's MeshAPI service destination (buy/cart ops) -- NOT the same
+-- hash as the page's own node_hash, see beacon.web / index.mu shop doorway.
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS shop_dest    TEXT;
+CREATE INDEX IF NOT EXISTS pages_availability_idx ON pages (availability) WHERE availability IS NOT NULL;
+
+-- Lever 4: hybrid vector search. Dim 768 = nomic-embed-text (the shared .88
+-- GPU Ollama embedder, see memory ollama-shared-model-store-88 /
+-- script-library-embedder). HNSW + cosine ops, matching how the query side
+-- ranks (embedding <=> query_vec). Embedding is written by the crawler at
+-- index time and by a resumable backfill loop for pre-existing rows; both
+-- paths degrade to leaving it NULL on any embedder failure (never blocks a
+-- crawl or raises), and `search()` below fully degrades to lexical-only when
+-- the embedder is unreachable OR returns the "uniform distance" pathology
+-- (see beacon.embed.looks_uniform).
+CREATE EXTENSION IF NOT EXISTS vector;
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS embedding vector(768);
+CREATE INDEX IF NOT EXISTS pages_embedding_hnsw_idx ON pages USING hnsw (embedding vector_cosine_ops);
+
+-- Anchor text folded into the field-weighted tsvector at weight B (same tier
+-- as headings -- both are "structural, not body" signals). Same
+-- drop+recreate-once trick as the ranking-v2 migration above, gated on a
+-- DIFFERENT marker ('anchors') so it fires exactly once on top of a DB that
+-- already has the v2 expression (which already contains 'setweight').
+DO $mig2$
+DECLARE
+  gen_expr text;
+BEGIN
+  SELECT pg_get_expr(d.adbin, d.adrelid) INTO gen_expr
+  FROM pg_attrdef d JOIN pg_attribute a
+    ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+  WHERE d.adrelid = 'pages'::regclass AND a.attname = 'content_tsv';
+
+  IF gen_expr IS NULL OR position('anchors' in gen_expr) = 0 THEN
+    EXECUTE 'ALTER TABLE pages DROP COLUMN IF EXISTS content_tsv';
+    EXECUTE $ddl$ALTER TABLE pages ADD COLUMN content_tsv TSVECTOR GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', coalesce(title,'')), 'A') ||
+        setweight(to_tsvector('english', coalesce(headings,'') || ' ' || coalesce(anchors,'')), 'B') ||
+        setweight(to_tsvector('english', coalesce(description,'')), 'C') ||
+        setweight(to_tsvector('english', coalesce(content,'')), 'D')
+      ) STORED$ddl$;
+    EXECUTE 'CREATE INDEX IF NOT EXISTS pages_tsv_idx ON pages USING GIN (content_tsv)';
+  END IF;
+END $mig2$;
+
+-- Lever 2: click-through. `clicks` (already exists, ln-scaled into ranking)
+-- is fed by two VERY different-quality sources: mesh clients deep-link
+-- straight to a result's page (no interstitial -- see git history "drop
+-- click-through interstitial"), so Beacon structurally cannot see a mesh
+-- click without adding a hop nobody wants; the web /go redirect (below) is
+-- the only surface that can log a REAL click without that cost. `impressions`
+-- is the honest substitute on the mesh side: log what was SHOWN for a query
+-- (not what got clicked) so at least coverage/relevance is debuggable there.
+-- `click_events` is aggregate-only web click history (query_hash + url + ts,
+-- no visitor id) for the analytics dashboard -- distinct from `clicks`, which
+-- stays the compact per-url counter the ranking formula reads.
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS shown_urls TEXT[];
+CREATE TABLE IF NOT EXISTS click_events (
+    id          BIGSERIAL PRIMARY KEY,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    query_hash  TEXT,
+    url         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS click_events_ts_idx  ON click_events (ts);
+CREATE INDEX IF NOT EXISTS click_events_url_idx ON click_events (url);
 """
 
 
 def init_schema(conn):
     with conn, conn.cursor() as c:
+        # This host's Postgres container runs with a small --shm-size; a
+        # parallel maintenance operation (building the HNSW index below, or
+        # the content_tsv table rewrite in the DO blocks) can request a DSM
+        # segment bigger than that and fail with "could not resize shared
+        # memory segment ... No space left on device" even though the HOST
+        # itself has plenty of free RAM (hit + confirmed live 2026-08-16).
+        # Migrations run once at boot, not the query hot path, so forcing
+        # single-threaded execution here is a cheap, safe guard -- SET LOCAL
+        # scopes it to this transaction only.
+        c.execute("SET LOCAL max_parallel_maintenance_workers = 0")
+        c.execute("SET LOCAL max_parallel_workers_per_gather = 0")
         c.execute(SCHEMA)
         c.execute(MIGRATIONS)
 
@@ -279,14 +381,25 @@ def drop_queue(conn, url):
 def record_page(conn, url, node_hash, path, title, content, content_hash, nbytes,
                 ok=True, ptype=None, description=None, lang=None, tags=None,
                 md_declared=False, fetch_ms=None, md_date=None, canonical=None,
-                headings=None, inferred_type=None):
+                headings=None, inferred_type=None, price=None, currency=None,
+                availability=None, sku=None, vendor=None, shop_dest=None,
+                embedding=None):
+    """embedding: a pgvector text literal ("[0.1,0.2,...]", see beacon.embed.
+    to_vector_literal) or None. On conflict it's preserved with COALESCE
+    rather than overwritten -- unlike every other field here (which should
+    always reflect the newest crawl), a NULL embedding on a recrawl usually
+    just means the embedder was down for THIS fetch, not that the page lost
+    its embedding; clobbering a good vector on a transient outage would erode
+    the corpus every recrawl cycle instead of just missing one update."""
     with conn, conn.cursor() as c:
         c.execute(
             """INSERT INTO pages (url, node_hash, path, title, content, content_hash,
                                   bytes, ok, type, description, lang, tags, md_declared,
                                   fetch_ms, md_date, canonical, headings, inferred_type,
-                                  fetched_at, first_seen, last_changed)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), now(), now())
+                                  price, currency, availability, sku, vendor, shop_dest,
+                                  embedding, fetched_at, first_seen, last_changed)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       %s,%s,%s,%s,%s,%s, %s::vector, now(), now(), now())
                ON CONFLICT (url) DO UPDATE
                  SET title=EXCLUDED.title, content=EXCLUDED.content,
                      content_hash=EXCLUDED.content_hash, bytes=EXCLUDED.bytes,
@@ -295,6 +408,10 @@ def record_page(conn, url, node_hash, path, title, content, content_hash, nbytes
                      fetch_ms=EXCLUDED.fetch_ms, md_date=EXCLUDED.md_date,
                      canonical=EXCLUDED.canonical, headings=EXCLUDED.headings,
                      inferred_type=EXCLUDED.inferred_type, fetched_at=now(),
+                     price=EXCLUDED.price, currency=EXCLUDED.currency,
+                     availability=EXCLUDED.availability, sku=EXCLUDED.sku,
+                     vendor=EXCLUDED.vendor, shop_dest=EXCLUDED.shop_dest,
+                     embedding=COALESCE(EXCLUDED.embedding, pages.embedding),
                      -- first_seen is immutable once set. last_changed only
                      -- moves when the content actually changed (content-hash
                      -- comparison) -- an unchanged page recrawled daily must
@@ -304,20 +421,67 @@ def record_page(conn, url, node_hash, path, title, content, content_hash, nbytes
                        THEN now() ELSE pages.last_changed END""",
             (url, node_hash, path, title, content, content_hash, nbytes, ok,
              ptype, description, lang, tags, md_declared, fetch_ms, md_date,
-             canonical, headings, inferred_type),
+             canonical, headings, inferred_type, price, currency, availability,
+             sku, vendor, shop_dest, embedding),
         )
 
 
 def record_links(conn, from_url, edges):
+    """edges: [(to_url, to_node_hash, to_path, label)]. `label` is the visible
+    anchor text of the micron link (may be None/empty). A recrawl re-extracts
+    the same edge and its (possibly changed) label; DO UPDATE keeps the newest
+    non-empty label rather than clobbering a good one with a blank re-read."""
     if not edges:
         return
     with conn, conn.cursor() as c:
         psycopg2.extras.execute_values(
             c,
-            "INSERT INTO links (from_url, to_url, to_node_hash, to_path) VALUES %s "
-            "ON CONFLICT (from_url, to_url) DO NOTHING",
-            [(from_url, to_url, nh, p) for (to_url, nh, p) in edges],
+            "INSERT INTO links (from_url, to_url, to_node_hash, to_path, label) VALUES %s "
+            "ON CONFLICT (from_url, to_url) DO UPDATE "
+            "SET label = COALESCE(EXCLUDED.label, links.label)",
+            [(from_url, to_url, nh, p, (label or None)) for (to_url, nh, p, label) in edges],
         )
+
+
+def refresh_anchors(conn, urls=None):
+    """Fold inbound link labels into each target page's `anchors` column (the
+    tsvector weight-B input for lever 1). Distinct labels only (a page linked
+    100x with the same label shouldn't drown out a page linked once with a
+    different one), capped so a heavily-linked page can't blow up row size or
+    dominate the tsvector on sheer volume. `urls` limits the refresh to a
+    specific set of target pages (cheap, called right after a crawl records
+    new links); omitted -> refresh every page with any labelled inbound link
+    (the periodic sweep, same cadence as the lexicon refresh)."""
+    where = ""
+    params = [_ANCHOR_MAXLEN]
+    if urls:
+        where = "AND to_url = ANY(%s)"
+        params.append(list(urls))
+    with conn, conn.cursor() as c:
+        c.execute(
+            f"""
+            WITH agg AS (
+                SELECT to_url,
+                       left(string_agg(lbl, ' '), %s) AS txt
+                FROM (
+                    SELECT DISTINCT to_url, trim(label) AS lbl
+                    FROM links
+                    WHERE label IS NOT NULL AND trim(label) <> '' {where}
+                    ORDER BY to_url, lbl
+                ) d
+                GROUP BY to_url
+                -- no true per-group LIMIT in plain SQL (would need a lateral
+                -- join); the outer `left(...)` length cap is the practical
+                -- bound instead -- good enough at this corpus size.
+            )
+            UPDATE pages p SET anchors = agg.txt
+            FROM agg WHERE p.url = agg.to_url AND p.anchors IS DISTINCT FROM agg.txt
+            """,
+            params,
+        )
+
+
+_ANCHOR_MAXLEN = 2000       # cap the aggregated anchor text per page (abuse/bloat guard)
 
 
 def mark_node_crawled(conn, node_hash, reachable):
@@ -426,16 +590,83 @@ def rum_by_day(conn, days=14):
 
 
 # ---- Search analytics (what people search, and what returns nothing) --------
-def record_search(conn, q, results, suggested=False):
+def normalize_query(q):
+    return " ".join((q or "").lower().split())[:200]
+
+
+def query_hash(q):
+    """Opaque, non-reversible-in-practice key for correlating a web click back
+    to the query that produced it, WITHOUT storing the raw query text on the
+    click row (click_events is meant to stay a thin, aggregate-only table)."""
+    import hashlib
+    qn = normalize_query(q)
+    return hashlib.sha256(qn.encode("utf-8")).hexdigest()[:16] if qn else None
+
+
+def record_search(conn, q, results, suggested=False, urls=None):
     """Log a handled query for analytics. `q` is normalised (lowercased, trimmed,
     collapsed whitespace) so popularity groups cleanly; it is NOT linked to any
-    visitor. Overly long queries are truncated."""
-    qn = " ".join((q or "").lower().split())[:200]
+    visitor. Overly long queries are truncated.
+
+    `urls`: the page-1 result set actually SHOWN for this query (impressions).
+    This is the mesh-side half of lever 2's click-through story -- mesh result
+    links go straight to the target page (no interstitial hop), so Beacon
+    structurally cannot see a mesh click, but it CAN see what it displayed.
+    Capped to keep the row small; real click counts still come only from the
+    web /go redirect (beacon.web), which is the one surface that can log a
+    click natively. See beacon.web._go for the rest of this story."""
+    qn = normalize_query(q)
     if not qn:
         return
+    shown = (urls or [])[:_IMPRESSIONS_CAP]
     with conn, conn.cursor() as c:
-        c.execute("INSERT INTO searches (q, results, suggested) VALUES (%s,%s,%s)",
-                  (qn, int(results), bool(suggested)))
+        c.execute("INSERT INTO searches (q, results, suggested, shown_urls) VALUES (%s,%s,%s,%s)",
+                  (qn, int(results), bool(suggested), shown or None))
+
+
+_IMPRESSIONS_CAP = 20
+
+
+# ---- Web click-through (lever 2; see record_search's docstring for the
+# mesh-vs-web asymmetry this is one half of) ---------------------------------
+def page_by_url(conn, url):
+    """Look up a known crawled page by its exact url -- used to validate /go
+    redirect targets (an open redirect is not an acceptable tradeoff for
+    click logging, however low-traffic the endpoint is today)."""
+    if not url:
+        return None
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+        c.execute("SELECT url, node_hash, path, canonical FROM pages WHERE url = %s AND ok", (url,))
+        return c.fetchone()
+
+
+def record_click_event(conn, url, q=None):
+    """Aggregate-only web click log: (query_hash, url, ts). No visitor id --
+    same privacy stance as Beacon-Analytics page_events. Also promotes the
+    url in the existing `clicks` counter, which is what the ranking formula's
+    ln(clicks) term actually reads -- this IS the real data behind that term
+    for any surface that can log natively (currently: web only)."""
+    qh = query_hash(q) if q else None
+    with conn, conn.cursor() as c:
+        c.execute("INSERT INTO click_events (query_hash, url) VALUES (%s,%s)", (qh, url))
+    record_click(conn, url)
+
+
+def click_event_stats(conn):
+    with conn, conn.cursor() as c:
+        out = {}
+        c.execute("SELECT count(*) FROM click_events"); out["clicks"] = c.fetchone()[0]
+        c.execute("SELECT count(*) FROM click_events WHERE ts > now() - interval '24 hours'")
+        out["clicks_24h"] = c.fetchone()[0]
+        c.execute("SELECT count(DISTINCT url) FROM click_events"); out["distinct_urls"] = c.fetchone()[0]
+        return out
+
+
+def top_clicked(conn, limit=15):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT url, count(*) n, max(ts) last FROM click_events "
+                  "GROUP BY url ORDER BY n DESC, last DESC LIMIT %s", (limit,))
+        return [{"url": r[0], "clicks": r[1]} for r in c.fetchall()]
 
 
 def search_stats(conn):
@@ -604,8 +835,78 @@ _HEADLINE_OPTS = (f"MaxFragments=3, MaxWords=28, MinWords=10, ShortWord=3, "
                   f"StartSel={_HL_START}, StopSel={_HL_STOP}, FragmentDelimiter={_HL_FRAG}")
 
 
+# ---- Hybrid vector search (lever 4) ----------------------------------------
+# Query-time ANN candidates, fused with the lexical candidate set via
+# Reciprocal Rank Fusion (k=60) BEFORE the multiplier stack below runs -- i.e.
+# the fused rank becomes the `rel` that schema/trust/responsiveness/freshness/
+# intent all multiply against, exactly like ts_rank_cd did before this lever.
+# Degrades to None (pure lexical, byte-for-byte the pre-lever behaviour) on
+# ANY embedder problem: unreachable, timeout, malformed response, or the
+# "uniform distance" pathology -- see beacon.embed for what each of those
+# means and why they're all treated as "can't trust this".
+VECTOR_TOPK = int(os.environ.get("BEACON_VECTOR_TOPK", "100"))
+RRF_K = int(os.environ.get("BEACON_RRF_K", "60"))
+
+
+def _vector_candidates(conn, query, topk=None):
+    """Best-effort ANN candidate URLs (most-similar first), or None if the
+    embedder is unavailable/degraded. Never raises."""
+    from . import embed as _embed
+    try:
+        qvec = _embed.embed_query(query)
+        if not qvec:
+            return None
+        lit = _embed.to_vector_literal(qvec)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+            c.execute(
+                "SELECT url, (embedding <=> %s::vector) AS dist FROM pages "
+                "WHERE ok AND embedding IS NOT NULL "
+                "ORDER BY embedding <=> %s::vector LIMIT %s",
+                (lit, lit, topk or VECTOR_TOPK))
+            rows = c.fetchall()
+        if not rows:
+            return None
+        if _embed.looks_uniform([float(r["dist"]) for r in rows]):
+            import sys
+            print("[beacon] vector search degraded: uniform cosine distances "
+                  "(embedder likely down or serving garbage) -- falling back "
+                  "to lexical-only", file=sys.stderr, flush=True)
+            return None
+        return [r["url"] for r in rows]
+    except Exception as e:  # noqa: BLE001 -- vector search is a bonus, never a blocker
+        import sys
+        print(f"[beacon] vector search error, falling back to lexical-only: {e}",
+              file=sys.stderr, flush=True)
+        return None
+
+
+def pages_needing_embedding(conn, limit=20):
+    """Oldest-first batch of ok pages with no embedding yet -- the resumable
+    backfill's work queue (progress persisted in the DB itself: a restart just
+    resumes wherever embedding IS NULL still holds)."""
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+        c.execute("SELECT id, title, description, headings, content FROM pages "
+                  "WHERE ok AND embedding IS NULL ORDER BY id LIMIT %s", (limit,))
+        return c.fetchall()
+
+
+def set_embedding(conn, page_id, vec_literal):
+    with conn, conn.cursor() as c:
+        c.execute("UPDATE pages SET embedding = %s::vector WHERE id = %s", (vec_literal, page_id))
+
+
+def embedding_backlog_count(conn):
+    with conn, conn.cursor() as c:
+        c.execute("SELECT count(*) FROM pages WHERE ok AND embedding IS NULL")
+        backlog = c.fetchone()[0]
+        c.execute("SELECT count(*) FROM pages WHERE ok AND embedding IS NOT NULL")
+        embedded = c.fetchone()[0]
+        return {"backlog": backlog, "embedded": embedded}
+
+
 # Ranking = field-weighted full-text relevance (ts_rank_cd over a title(A) /
-# headings(B) / description(C) / body(D) tsvector) times:
+# headings+anchors(B) / description(C) / body(D) tsvector), fused with vector
+# similarity (RRF, see above) when the embedder is healthy, times:
 #   * MeshData schema bonus (hard-capped flat +40% for a self-describing page
 #     -- a single boolean multiplier, so it can't be inflated by declaring
 #     more fields);
@@ -622,12 +923,18 @@ _HEADLINE_OPTS = (f"MaxFragments=3, MaxWords=28, MinWords=10, ShortWord=3, "
 def search(conn, query, limit=15, ptype=None):
     if not query or not query.strip():
         return []
-    params = [query]
+
+    vec_urls = _vector_candidates(conn, query)          # None => lexical-only path
+    vec_rank = {u: i for i, u in enumerate(vec_urls)} if vec_urls else {}
+    vec_url_list = vec_urls or []
+
     type_clause = ""
     if ptype:
         type_clause = " AND p.type = %s"
-        params.append(ptype)
-    params.append(limit)
+    # Generous candidate pool: big enough to hold every lexical match up to
+    # VECTOR_TOPK plus every vector candidate, so RRF fusion (below) sees the
+    # full picture before Python does the final rank + truncate to `limit`.
+    sql_limit = max(limit, VECTOR_TOPK) + len(vec_url_list) + 20
     # Fragment/highlight markers are plain ASCII tokens (no quotes/backslashes/
     # `%`) so they're safe to write directly into the SQL text -- no need to
     # smuggle them through as bind params or Python repr() (which would hit
@@ -646,23 +953,46 @@ def search(conn, query, limit=15, ptype=None):
                ts_headline('english', coalesce(p.content,''), q.tsq,
                    '{_HEADLINE_OPTS}') AS raw_headline,
                coalesce(cl.clicks, 0) AS clicks,
-               (SELECT count(*) FROM links l WHERE l.to_url = p.url) AS inbound
+               (SELECT count(*) FROM links l WHERE l.to_url = p.url) AS inbound,
+               p.price, p.currency, p.availability, p.sku, p.vendor, p.shop_dest
         FROM pages p
         CROSS JOIN q
         LEFT JOIN nodes n ON n.dest_hash = p.node_hash
         LEFT JOIN clicks cl ON cl.url = p.url
-        WHERE p.ok AND p.content_tsv @@ q.tsq{type_clause}
+        WHERE p.ok AND (p.content_tsv @@ q.tsq OR p.url = ANY(%s)){type_clause}
         ORDER BY rel DESC
         LIMIT %s
     """
+    params = [query, vec_url_list]
+    if ptype:
+        params.append(ptype)
+    params.append(sql_limit)
     with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
         c.execute(sql, params)
         rows = c.fetchall()
+
+    # Lexical rank among the fetched rows (index into rel-desc order, skipping
+    # non-matches which the OR clause can pull in as pure vector hits with
+    # rel=0). Approximates the true lexical-only ranking closely enough for
+    # RRF purposes given the generous sql_limit above.
+    lex_sorted = sorted(rows, key=lambda r: float(r["rel"] or 0), reverse=True)
+    lex_rank = {r["url"]: i for i, r in enumerate(lex_sorted) if float(r["rel"] or 0) > 0}
 
     boost, demote = _intent_multipliers(query)
     now = datetime.now(timezone.utc)
     out = []
     for r in rows:
+        u = r["url"]
+        if vec_urls is None:
+            rel_fused = float(r["rel"] or 0)             # unchanged pre-lever behaviour
+        else:
+            rrf = 0.0
+            if u in lex_rank:
+                rrf += 1.0 / (RRF_K + 1 + lex_rank[u])
+            if u in vec_rank:
+                rrf += 1.0 / (RRF_K + 1 + vec_rank[u])
+            rel_fused = rrf
+
         rtype = _rank_type(r["type"], r["inferred_type"])
         schema_bonus = 1.0 + 0.4 * int(bool(r["md_declared"]))              # hard-capped
         trust = 1.0 + math.log1p(r["announces"] or 1) * 0.1
@@ -671,7 +1001,7 @@ def search(conn, query, limit=15, ptype=None):
         fresh = _freshness_multiplier(rtype, r["effective_date"], now)
         intent = boost.get(rtype) or demote.get(rtype) or 1.0
         inbound_bonus = math.log1p(r["clicks"] or 0) * 0.3 + math.log1p(r["inbound"] or 0) * 0.2
-        base = float(r["rel"]) * schema_bonus * trust * responsiveness * fresh * intent
+        base = rel_fused * schema_bonus * trust * responsiveness * fresh * intent
         score = base + inbound_bonus
 
         snippet, all_junk = _pick_snippet(r["raw_headline"], r["description"], r["title"])
@@ -688,10 +1018,15 @@ def search(conn, query, limit=15, ptype=None):
             "snippet": snippet,
             "date": ed.date().isoformat() if ed else None,
             "content_hash": r["content_hash"], "canonical": r["canonical"],
+            # Rich product result fields (lever 3) -- None on every non-product
+            # row; umsgpack-safe (price cast off Decimal to float).
+            "price": float(r["price"]) if r["price"] is not None else None,
+            "currency": r["currency"], "availability": r["availability"],
+            "sku": r["sku"], "vendor": r["vendor"], "shop": r["shop_dest"],
             "score": round(score, 5),
         })
     out.sort(key=lambda x: x["score"], reverse=True)
-    return out
+    return out[:limit]
 
 
 # ---- "Did you mean?" spelling suggestions (pg_trgm) -------------------------
