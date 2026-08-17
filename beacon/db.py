@@ -1002,11 +1002,12 @@ def search(conn, query, limit=15, ptype=None):
     out = []
     for r in rows:
         u = r["url"]
+        is_lexical_match = u in lex_rank
         if vec_urls is None:
             rel_fused = float(r["rel"] or 0)             # unchanged pre-lever behaviour
         else:
             rrf = 0.0
-            if u in lex_rank:
+            if is_lexical_match:
                 rrf += 1.0 / (RRF_K + 1 + lex_rank[u])
             if u in vec_rank:
                 rrf += 1.0 / (RRF_K + 1 + vec_rank[u])
@@ -1019,7 +1020,20 @@ def search(conn, query, limit=15, ptype=None):
         responsiveness = 1.15 - (fetch_ms / 15000.0) * 0.30
         fresh = _freshness_multiplier(rtype, r["effective_date"], now)
         intent = boost.get(rtype) or demote.get(rtype) or 1.0
-        inbound_bonus = math.log1p(r["clicks"] or 0) * 0.3 + math.log1p(r["inbound"] or 0) * 0.2
+        # Click/inbound-link promotion was designed (ranking-v2) under the
+        # assumption that only a genuine relevance match ever reaches this
+        # code -- the old WHERE clause required one. Lever 4 breaks that: a
+        # row can now arrive on vector similarity ALONE. Found live: a page
+        # with 18 inbound links and ZERO relevance to "zine" outscored the
+        # actual zine product purely on this additive term. So popularity
+        # only counts as a tie-breaker for rows that ALSO cleared a real
+        # relevance bar (lexical match, or -- when lexical-only, i.e. no
+        # embedder -- every row qualifies by construction); a vector-only
+        # admission is scored on rel_fused alone, same as everything else.
+        if is_lexical_match or vec_urls is None:
+            inbound_bonus = math.log1p(r["clicks"] or 0) * 0.3 + math.log1p(r["inbound"] or 0) * 0.2
+        else:
+            inbound_bonus = 0.0
         base = rel_fused * schema_bonus * trust * responsiveness * fresh * intent
         score = base + inbound_bonus
 
