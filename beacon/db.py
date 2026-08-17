@@ -846,6 +846,19 @@ _HEADLINE_OPTS = (f"MaxFragments=3, MaxWords=28, MinWords=10, ShortWord=3, "
 # means and why they're all treated as "can't trust this".
 VECTOR_TOPK = int(os.environ.get("BEACON_VECTOR_TOPK", "100"))
 RRF_K = int(os.environ.get("BEACON_RRF_K", "60"))
+# How many of the top-VECTOR_TOPK ANN candidates are allowed to enter the
+# result pool WITHOUT also lexically matching (see search()'s "OR p.url = ANY
+# (...)" clause). Found live (2026-08-16): pulling in all 100 let a page with
+# ZERO lexical relevance but a merely-mediocre vector rank (e.g. #51/100, a
+# cosine distance barely different from #99 -- noise, not signal) into
+# scoring, where the pre-existing ADDITIVE inbound-link/click bonus (designed
+# under the assumption "only genuine matches reach this code") let a heavily-
+# linked but topically irrelevant hub page bury the real match ("zine" ->
+# a page with 602 inbound links and rel=0 outscored the actual zine product
+# 1.29 vs 0.25). The full VECTOR_TOPK window still feeds RRF rank credit for
+# anything that's ALSO a lexical match; this constant only gates the "vector
+# alone is enough to appear at all" door to a higher-confidence slice.
+VECTOR_PULL_N = int(os.environ.get("BEACON_VECTOR_PULL_N", "25"))
 
 
 def _vector_candidates(conn, query, topk=None):
@@ -925,16 +938,22 @@ def search(conn, query, limit=15, ptype=None):
         return []
 
     vec_urls = _vector_candidates(conn, query)          # None => lexical-only path
+    # Full window feeds RRF rank credit for anything that ALSO lexically
+    # matches; only the higher-confidence head (VECTOR_PULL_N) can pull a
+    # NEW row into the pool on vector similarity alone -- see VECTOR_PULL_N's
+    # docstring for why the full 100 there was a live-verified false-positive
+    # magnet once the pre-existing additive inbound-link bonus saw it.
     vec_rank = {u: i for i, u in enumerate(vec_urls)} if vec_urls else {}
-    vec_url_list = vec_urls or []
+    vec_pull_list = (vec_urls or [])[:VECTOR_PULL_N]
 
     type_clause = ""
     if ptype:
         type_clause = " AND p.type = %s"
     # Generous candidate pool: big enough to hold every lexical match up to
-    # VECTOR_TOPK plus every vector candidate, so RRF fusion (below) sees the
-    # full picture before Python does the final rank + truncate to `limit`.
-    sql_limit = max(limit, VECTOR_TOPK) + len(vec_url_list) + 20
+    # VECTOR_TOPK plus every pulled vector candidate, so RRF fusion (below)
+    # sees the full picture before Python does the final rank + truncate to
+    # `limit`.
+    sql_limit = max(limit, VECTOR_TOPK) + len(vec_pull_list) + 20
     # Fragment/highlight markers are plain ASCII tokens (no quotes/backslashes/
     # `%`) so they're safe to write directly into the SQL text -- no need to
     # smuggle them through as bind params or Python repr() (which would hit
@@ -963,7 +982,7 @@ def search(conn, query, limit=15, ptype=None):
         ORDER BY rel DESC
         LIMIT %s
     """
-    params = [query, vec_url_list]
+    params = [query, vec_pull_list]
     if ptype:
         params.append(ptype)
     params.append(sql_limit)
