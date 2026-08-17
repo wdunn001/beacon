@@ -29,10 +29,23 @@ EMBED_MODEL = os.environ.get("BEACON_EMBED_MODEL", "nomic-embed-text")
 EMBED_TIMEOUT = float(os.environ.get("BEACON_EMBED_TIMEOUT", "4"))
 EMBED_DIM = int(os.environ.get("BEACON_EMBED_DIM", "768"))
 
-# Char caps (not token-exact, but a safe, cheap guard well under nomic's
-# context window) -- documents get more room than queries.
-_DOC_CHARS = 8000
-_QUERY_CHARS = 2000
+# Char caps (not token-exact, but a safe, cheap guard). Found live
+# (2026-08-16): this deployment's nomic-embed-text is loaded with a 2048-
+# TOKEN context (`ollama ps` -> CONTEXT 2048, not the model's max 8192 --
+# whatever loaded it capped it there), and Ollama 500s outright on overflow
+# ("the input length exceeds the context length") rather than truncating --
+# which _call() correctly treats as a soft failure (HTTPError is a
+# URLError subclass, caught below) and returns None for, but an 8000-char
+# cap assumed ~4 chars/token and blew straight through 2048 tokens on
+# anything non-trivial: a 37KB Cyrillic page, a 7KB tech-jargon page, and a
+# box-drawing-heavy page ALL 500'd, stalling the backfill on most of the
+# corpus (non-Latin scripts and code/punctuation-dense text run well under
+# 4 chars/token in BPE tokenizers). 3000 chars is a conservative ~1.5
+# chars/token budget that leaves headroom for the "search_document: "/
+# "search_query: " prefix -- safe across scripts, still plenty of text for
+# a decent embedding. Documents get more room than queries.
+_DOC_CHARS = 2500
+_QUERY_CHARS = 1000
 
 
 def _call(prompt, timeout):
