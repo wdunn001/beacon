@@ -16,15 +16,15 @@ Postgres registry + page store with full-text search ready (a generated
 top.
 
 ## Architecture
-- **Announce listener** — an RNS `AnnounceHandler` on `nomadnetwork.node`; every
+- **Announce listener**. An RNS `AnnounceHandler` on `nomadnetwork.node`; every
   node's hash + name + first/last-seen lands in the `nodes` registry, and its
   `index.mu` is queued.
-- **Crawler** — opens a Link to each node, requests page paths, extracts readable
+- **Crawler**. Opens a Link to each node, requests page paths, extracts readable
   text + a title + outgoing micron links, stores them, and follows links (same
   node + cross-mesh). Polite: one fetch at a time, a delay between fetches (LoRa
   is slow/intermittent), indexes only text pages (skips binaries), recrawls daily.
-- **Store** — Postgres: `nodes`, `pages` (+ FTS `tsvector`), `links`, `crawl_queue`.
-- **/healthz + /stats** — JSON, for monitoring and a future dashboard.
+- **Store**. Postgres: `nodes`, `pages` (+ FTS `tsvector`), `links`, `crawl_queue`.
+- **/healthz + /stats**. JSON, for monitoring and a future dashboard.
 
 ## Run
 ```bash
