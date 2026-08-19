@@ -1,7 +1,7 @@
 """Federated search: fold results from sibling MeshAPI services (currently
 rns-wiki's Xapian search over the offline encyclopedia) into Beacon's own
 page-index results. This surfaces content Beacon can't crawl -- the Kiwix wiki
-is dynamic (read.mu?ref=…, millions of pages) -- without indexing it.
+is dynamic (read.mu?ref=..., millions of pages) -- without indexing it.
 
 Beacon already runs an RNS instance (the crawler's), so we just open a Link to
 the sibling service and call its search op. Failures degrade to [] -- federation

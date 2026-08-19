@@ -50,7 +50,7 @@ def extract_links(text, node_hash):
                 nh, path = h.lower(), p
         if not path or not path.startswith("/page/"):
             continue
-        # a dynamic reader link (read.mu?ref=…) is one distinct target per ref;
+        # a dynamic reader link (read.mu?ref=...) is one distinct target per ref;
         # fold ref into the url so link-graph counting matches federated results.
         ref = None
         for kv in fields.split("|"):
